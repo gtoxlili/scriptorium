@@ -1,5 +1,6 @@
 # scriptorium
 
+[![CI](https://github.com/gtoxlili/scriptorium/actions/workflows/ci.yml/badge.svg)](https://github.com/gtoxlili/scriptorium/actions/workflows/ci.yml)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2024%20edition-orange.svg)](https://www.rust-lang.org/)
 [![Transport](https://img.shields.io/badge/Transport-gRPC-lightgrey.svg)](proto/sandbox.proto)
