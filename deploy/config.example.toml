@@ -1,0 +1,28 @@
+# scriptorium example configuration.
+# Copy to deploy/config.toml (or pass an explicit path via --config) and edit.
+
+[server]
+listen = "127.0.0.1:50051"
+
+[docker]
+# OrbStack's Docker-compatible socket on macOS.
+# Docker Desktop uses /var/run/docker.sock; Colima typically uses ~/.colima/default/docker.sock.
+socket = "/Users/influo/.orbstack/run/docker.sock"
+control_timeout_seconds = 60
+
+[sandbox]
+# Image tag is pinned by convention. Build it from docker/sandbox.Dockerfile.
+default_image = "scriptorium-sandbox:debian12-v1"
+default_timeout_seconds = 300
+default_cpu_millis = 4000                        # 4 cores
+default_memory_bytes = 8589934592                # 8 GiB
+default_pids = 512
+default_tmpfs_bytes = 2147483648                 # 2 GiB
+agent_uid = 1000
+agent_gid = 1000
+workspace_mount = "/home/agent"
+
+[workspace]
+# Where per-workspace persistent state lives on the host. Point this at the
+# external SSD. Each workspace_id becomes a direct child directory.
+root = "/Volumes/external/scriptorium-state"

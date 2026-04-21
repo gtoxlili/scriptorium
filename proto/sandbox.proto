@@ -1,0 +1,162 @@
+syntax = "proto3";
+
+package scriptorium.v1;
+
+// Sandbox is the public gRPC surface of the scriptorium service.
+// It spawns ephemeral, isolated containers for LLM-driven code execution
+// and RPA workloads. Each call spins up a fresh container; persistent
+// state lives in an on-disk workspace keyed by an opaque caller-provided
+// identifier.
+service Sandbox {
+  // Exec runs a shell command inside a freshly spawned sandbox container.
+  // The container is torn down when the call returns. Persistent state
+  // under the workspace directory survives.
+  rpc Exec(ExecRequest) returns (ExecResponse);
+
+  // ExecStream is the streaming variant that emits stdout/stderr in real time.
+  rpc ExecStream(ExecRequest) returns (stream ExecEvent);
+
+  // PutFile writes a single file into the workspace directory (host-side
+  // filesystem operation; no container is spawned).
+  rpc PutFile(stream PutFileRequest) returns (PutFileResponse);
+
+  // GetFile reads a single file from the workspace directory.
+  rpc GetFile(GetFileRequest) returns (stream GetFileChunk);
+
+  // ListFiles lists files under a workspace path.
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+
+  // DeleteWorkspace removes the entire workspace directory for a given id.
+  // Intended for admin/GC use, not for the LLM.
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
+
+  // Health reports the service and docker-daemon status.
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// ─── Exec ──────────────────────────────────────────────────────────────────
+
+message ExecRequest {
+  // Opaque caller-defined workspace identifier (e.g. a chat session id).
+  // Maps 1:1 to a persistent directory on disk. Must match [A-Za-z0-9_-]+.
+  string workspace_id = 1;
+
+  // Tenant identifier — used for audit logging. Free-form, not validated.
+  string tenant_id = 2;
+
+  // Shell command to execute inside the container, via `bash -lc`.
+  string command = 3;
+
+  // Hard wall-clock timeout in seconds. 0 means "server default".
+  uint32 timeout_seconds = 4;
+
+  // Additional environment variables to inject.
+  map<string, string> env = 5;
+
+  // Optional image override. Empty = server default (the fat sandbox image).
+  string image = 6;
+
+  // Optional resource limits override.
+  ResourceLimits limits = 7;
+}
+
+message ResourceLimits {
+  uint32 cpu_millis = 1;      // e.g., 4000 = 4 cores
+  uint64 memory_bytes = 2;    // hard cap
+  uint32 pids = 3;            // --pids-limit
+  uint64 tmpfs_bytes = 4;     // writable /tmp size
+}
+
+message ExecResponse {
+  int32 exit_code = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+  uint64 duration_ms = 4;
+  bool timed_out = 5;
+}
+
+message ExecEvent {
+  oneof event {
+    ExecStarted started = 1;
+    StdoutChunk stdout = 2;
+    StderrChunk stderr = 3;
+    ExecFinished finished = 4;
+  }
+}
+message ExecStarted { string container_id = 1; }
+message StdoutChunk { bytes data = 1; }
+message StderrChunk { bytes data = 1; }
+message ExecFinished {
+  int32 exit_code = 1;
+  uint64 duration_ms = 2;
+  bool timed_out = 3;
+}
+
+// ─── Workspace file I/O ────────────────────────────────────────────────────
+
+message PutFileRequest {
+  // The first message must carry `header`; subsequent messages carry `chunk`.
+  oneof payload {
+    PutFileHeader header = 1;
+    bytes chunk = 2;
+  }
+}
+message PutFileHeader {
+  string workspace_id = 1;
+  // Path relative to the workspace root (e.g. "inputs/a.csv"). Traversal
+  // (`..`, absolute paths) is rejected server-side.
+  string path = 2;
+  // Unix mode bits (lower 9 bits). 0 = default 0644.
+  uint32 mode = 3;
+}
+message PutFileResponse {
+  uint64 bytes_written = 1;
+}
+
+message GetFileRequest {
+  string workspace_id = 1;
+  string path = 2;
+}
+message GetFileChunk {
+  oneof payload {
+    GetFileHeader header = 1;
+    bytes chunk = 2;
+  }
+}
+message GetFileHeader {
+  uint64 size_bytes = 1;
+  uint32 mode = 2;
+}
+
+message ListFilesRequest {
+  string workspace_id = 1;
+  // Directory within the workspace to list; empty = workspace root.
+  string path = 2;
+  bool recursive = 3;
+}
+message FileInfo {
+  string path = 1;        // relative to workspace root
+  uint64 size_bytes = 2;
+  uint32 mode = 3;
+  bool is_dir = 4;
+  int64 modified_unix = 5;
+}
+message ListFilesResponse {
+  repeated FileInfo files = 1;
+}
+
+message DeleteWorkspaceRequest {
+  string workspace_id = 1;
+}
+message DeleteWorkspaceResponse {
+  bool existed = 1;
+}
+
+// ─── Health ────────────────────────────────────────────────────────────────
+
+message HealthRequest {}
+message HealthResponse {
+  string version = 1;
+  string docker_version = 2;
+  bool docker_reachable = 3;
+}

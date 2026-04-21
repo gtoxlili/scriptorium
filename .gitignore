@@ -1,0 +1,18 @@
+/target
+/Cargo.lock.bak
+**/*.rs.bk
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# macOS
+.DS_Store
+
+# Local config & runtime state
+/deploy/config.local.toml
+/sandbox-state/

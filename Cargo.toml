@@ -1,0 +1,86 @@
+[package]
+name = "scriptorium"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Sandbox execution middleware — spawns isolated containers on demand for LLM-driven code and RPA workloads"
+authors = ["gtoxlili"]
+readme = "README.md"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/gtoxlili/scriptorium"
+homepage = "https://github.com/gtoxlili/scriptorium"
+keywords = ["sandbox", "llm", "agent", "grpc", "docker"]
+categories = ["command-line-utilities", "virtualization", "network-programming"]
+
+[[bin]]
+name = "scriptorium"
+path = "src/main.rs"
+
+[lib]
+name = "scriptorium"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime — scoped to what we actually use.
+tokio = { version = "1", features = [
+    "rt-multi-thread", "macros", "signal",
+    "fs", "io-util", "net", "time", "sync", "process",
+] }
+tokio-stream = "0.1"
+async-stream = "0.3"
+futures = "0.3"
+bytes = "1"
+
+# gRPC
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+
+# Docker client.
+bollard = "0.17"
+
+# Config / serde
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Filesystem paths
+path-clean = "1"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Lints are applied crate-wide via Cargo's unified lints section.
+# Pedantic is opt-in across modules — real-world exceptions are noted inline.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Exclusions chosen deliberately — these lints produce noise without uncovering bugs.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+# Matching on gRPC error codes reads cleanly as-is.
+match_same_arms = "allow"
+# Product names (OrbStack, Colima, Playwright, ...) in docs read better
+# without backtick fences; `doc_markdown` over-triggers on proper nouns.
+doc_markdown = "allow"
