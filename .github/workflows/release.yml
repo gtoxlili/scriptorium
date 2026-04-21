@@ -1,18 +1,20 @@
 name: Release
 
+# Strategy: push to main triggers a check of Cargo.toml's `version`.
+# If a release for that version does not yet exist, build binaries for four
+# targets and publish a GitHub Release. Normal commits (no version bump) are
+# detected in the first job and the pipeline short-circuits within seconds.
+#
+# The `version` field in Cargo.toml is the single source of truth — there is
+# no manual tagging. Bumping the version in a commit is what ships a release.
+
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Existing tag to release (e.g. v0.1.0)'
-        required: true
-        type: string
 
 permissions:
-  contents: write  # needed to create a GitHub Release
+  contents: write  # create the Release and its tag
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,30 +22,44 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  verify:
-    name: Verify tag / Cargo.toml alignment
+  detect:
+    name: Detect pending release
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      tag: ${{ steps.read.outputs.tag }}
+      should_release: ${{ steps.decide.outputs.should_release }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref }}
 
-      - name: Resolve target tag and assert it matches Cargo.toml version
+      - id: read
+        name: Read Cargo.toml version
         run: |
           set -euo pipefail
-          tag="${{ inputs.tag || github.ref_name }}"
-          tag="${tag#v}"
-          cargo_ver=$(awk -F '"' '/^version *=/ {print $2; exit}' Cargo.toml)
-          echo "tag=$tag"
-          echo "cargo=$cargo_ver"
-          if [[ "$tag" != "$cargo_ver" ]]; then
-            echo "::error::tag '$tag' does not match Cargo.toml version '$cargo_ver'"
-            exit 1
+          version=$(awk -F '"' '/^version *=/ {print $2; exit}' Cargo.toml)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: $version"
+
+      - id: decide
+        name: Release v$version already published?
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.read.outputs.tag }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::release $tag already exists — nothing to do"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::release $tag not yet published — will build and publish"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
           fi
 
   build:
     name: Build ${{ matrix.target }}
-    needs: verify
+    needs: detect
+    if: needs.detect.outputs.should_release == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -59,8 +75,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
@@ -85,7 +99,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="${{ needs.detect.outputs.tag }}"
           name="scriptorium-${tag}-${{ matrix.target }}"
           mkdir -p "$name"
           cp "target/${{ matrix.target }}/release/scriptorium" "$name/"
@@ -101,41 +115,14 @@ jobs:
             scriptorium-*.sha256
           if-no-files-found: error
 
-  publish-crate:
-    name: Publish to crates.io
-    needs: [verify, build]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: cargo publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
-            echo "::error::CARGO_REGISTRY_TOKEN secret is not set. Add it under Repository Settings → Secrets and variables → Actions."
-            exit 1
-          fi
-          cargo publish --locked
-
   release:
     name: Publish GitHub Release
-    needs: [build, publish-crate]
+    needs: [detect, build]
+    if: needs.detect.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0  # full history for auto-generated notes
 
       - uses: actions/download-artifact@v4
@@ -147,11 +134,13 @@ jobs:
       - name: softprops/action-gh-release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ needs.detect.outputs.tag }}
+          name: ${{ needs.detect.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: |
             artifacts/scriptorium-*.tar.gz
             artifacts/scriptorium-*.sha256
           generate_release_notes: true
           draft: false
-          # Treat tags like v1.0.0-rc1 as prereleases.
-          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
+          # Treat versions like 1.0.0-rc1 as prereleases.
+          prerelease: ${{ contains(needs.detect.outputs.version, '-') }}
