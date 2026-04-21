@@ -202,6 +202,15 @@ impl Sandbox for SandboxService {
             fs::create_dir_all(parent).await.map_err(Error::from)?;
         }
 
+        // Delete any pre-existing file so an entry owned by a previous
+        // exec's container UID doesn't block the server (running as a
+        // different UID) from recreating it.
+        match fs::remove_file(&target).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::from(e).into()),
+        }
+
         let file = fs::File::create(&target).await.map_err(Error::from)?;
         let mut writer = BufWriter::new(file);
         let mut bytes_written: u64 = 0;
@@ -222,7 +231,9 @@ impl Sandbox for SandboxService {
         writer.flush().await.map_err(Error::from)?;
         writer.into_inner().sync_all().await.map_err(Error::from)?;
 
-        // Apply requested mode, falling back to 0644.
+        // Permissions are set to a mode that lets the container user read
+        // (`o+r`) — we can't chown to the container UID on non-root hosts,
+        // so we rely on the "other" bit. 0644 is the default.
         let mode = if header.mode == 0 {
             0o644
         } else {
@@ -231,17 +242,9 @@ impl Sandbox for SandboxService {
         fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
             .await
             .map_err(Error::from)?;
-
-        // Chown to the in-container user so exec sees its own file.
-        let uid = sandbox.agent_uid;
-        let gid = sandbox.agent_gid;
-        let target_for_chown = target.clone();
-        tokio::task::spawn_blocking(move || {
-            std::os::unix::fs::chown(&target_for_chown, Some(uid), Some(gid))
-        })
-        .await
-        .map_err(|e| Error::Other(format!("chown join: {e}")))?
-        .map_err(Error::from)?;
+        // `sandbox` kept as an explicit binding so future work can reach
+        // back to config without re-plumbing — currently unused here.
+        let _ = sandbox;
 
         Ok(Response::new(PutFileResponse { bytes_written }))
     }

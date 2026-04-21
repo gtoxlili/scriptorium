@@ -1,4 +1,7 @@
-use std::{os::unix::fs::chown, path::PathBuf};
+use std::{
+    os::unix::fs::{PermissionsExt, chown},
+    path::PathBuf,
+};
 
 use path_clean::PathClean;
 use tokio::fs;
@@ -34,20 +37,38 @@ impl WorkspaceManager {
     }
 
     /// Resolve the host-side `home` directory for a workspace, creating it
-    /// on first use and chowning it to `uid:gid` so bind-mount writes from
-    /// the in-container non-root user land with correct ownership.
+    /// on first use and giving the in-container non-root user write access.
+    ///
+    /// The preferred path is a host-side `chown` to `uid:gid` so ownership
+    /// aligns with the container user. That requires the service to be
+    /// running as root (or to have `CAP_CHOWN`), which is typical in Linux
+    /// deployments but not on macOS dev setups. When the chown is rejected
+    /// with `EPERM` we fall back to `chmod 0777` — the directory is a
+    /// per-workspace leaf inside a service-owned root, so the broader
+    /// permission bit is acceptable and Docker's user namespace still
+    /// confines what the container itself can do.
     pub async fn ensure_home(&self, workspace_id: &str, uid: u32, gid: u32) -> Result<PathBuf> {
         validate_workspace_id(workspace_id)?;
         let home = self.cfg.root.join(workspace_id).join("home");
-
-        // `create_dir_all` is idempotent — only the freshly-created segment
-        // gets the default umask, so we re-chown every time to be safe.
         fs::create_dir_all(&home).await?;
 
         let home_clone = home.clone();
-        tokio::task::spawn_blocking(move || chown(&home_clone, Some(uid), Some(gid)))
-            .await
-            .map_err(|e| Error::Other(format!("chown join: {e}")))??;
+        let chown_result =
+            tokio::task::spawn_blocking(move || chown(&home_clone, Some(uid), Some(gid)))
+                .await
+                .map_err(|e| Error::Other(format!("chown join: {e}")))?;
+
+        if let Err(e) = chown_result {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                tracing::debug!(
+                    path = %home.display(),
+                    "chown denied — falling back to 0777 on workspace home"
+                );
+                fs::set_permissions(&home, std::fs::Permissions::from_mode(0o777)).await?;
+            } else {
+                return Err(e.into());
+            }
+        }
 
         Ok(home)
     }
