@@ -125,10 +125,12 @@ impl DockerRuntime {
 
         let wait = async {
             let mut wait_stream = docker.wait_container(&cid, None::<WaitContainerOptions<String>>);
-            if let Some(Ok(resp)) = wait_stream.next().await {
-                resp.status_code
-            } else {
-                -1
+            // bollard maps non-zero exit codes into a dedicated error variant,
+            // so we unwrap it back into the numeric code we actually want.
+            match wait_stream.next().await {
+                Some(Ok(resp)) => resp.status_code,
+                Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
+                _ => -1,
             }
         };
 
@@ -209,21 +211,43 @@ impl DockerRuntime {
 
         let stream = async_stream::stream! {
             let mut attach_stream = attach.output;
+            // Set up wait *concurrently* with attach so we capture the exit
+            // code before Docker's AutoRemove races to delete the container.
+            let mut wait_stream = docker.wait_container(
+                &cid_for_stream,
+                None::<WaitContainerOptions<String>>,
+            );
             let deadline = tokio::time::sleep(timeout);
             tokio::pin!(deadline);
 
+            let mut pending_exit: Option<i32> = None;
+            let mut wait_done = false;
+            let mut attach_done = false;
             let mut timed_out = false;
-            loop {
+
+            while !(wait_done && attach_done) {
                 tokio::select! {
                     () = &mut deadline => {
                         timed_out = true;
                         break;
                     }
-                    maybe = attach_stream.next() => match maybe {
+                    w = wait_stream.next(), if !wait_done => {
+                        wait_done = true;
+                        match w {
+                            Some(Ok(resp)) => {
+                                pending_exit = Some(i32::try_from(resp.status_code).unwrap_or(-1));
+                            }
+                            Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => {
+                                pending_exit = Some(i32::try_from(code).unwrap_or(-1));
+                            }
+                            _ => {}
+                        }
+                    }
+                    a = attach_stream.next(), if !attach_done => match a {
                         Some(Ok(LogOutput::StdOut { message })) => yield StreamEvent::Stdout(message),
                         Some(Ok(LogOutput::StdErr { message })) => yield StreamEvent::Stderr(message),
                         Some(Ok(_)) => {}
-                        Some(Err(_)) | None => break,
+                        Some(Err(_)) | None => attach_done = true,
                     }
                 }
             }
@@ -246,15 +270,7 @@ impl DockerRuntime {
                 return;
             }
 
-            // Normal exit — fetch the status code.
-            let mut wait_stream = docker.wait_container(
-                &cid_for_stream,
-                None::<WaitContainerOptions<String>>,
-            );
-            let exit_code = match wait_stream.next().await {
-                Some(Ok(resp)) => i32::try_from(resp.status_code).unwrap_or(-1),
-                _ => -1,
-            };
+            let exit_code = pending_exit.unwrap_or(-1);
             let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             yield StreamEvent::Finished { exit_code, timed_out: false, duration_ms };
         };
