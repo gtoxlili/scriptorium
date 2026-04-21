@@ -1,10 +1,25 @@
-use std::{fmt, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    path::PathBuf,
+    pin::Pin,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
-use bollard::Docker;
+use bollard::{
+    Docker,
+    container::{
+        AttachContainerOptions, Config, CreateContainerOptions, KillContainerOptions, LogOutput,
+        RemoveContainerOptions, WaitContainerOptions,
+    },
+    models::HostConfig,
+};
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
 
 use crate::{
     config::{DockerConfig, SandboxConfig},
-    error::Result,
+    error::{Error, Result},
 };
 
 /// `DockerRuntime` is the Docker-backed implementation of the container
@@ -49,6 +64,10 @@ impl DockerRuntime {
         &self.docker
     }
 
+    pub fn sandbox_cfg(&self) -> &SandboxConfig {
+        &self.sandbox_cfg
+    }
+
     pub async fn version_string(&self) -> String {
         match self.docker.version().await {
             Ok(v) => format!(
@@ -62,19 +81,262 @@ impl DockerRuntime {
 
     /// Spawn a container, run `command` inside it via `bash -lc`, and return
     /// the collected output. The container is removed when the call returns.
-    ///
-    /// This is the MVP one-shot path; streaming is wired in `ExecStream`.
-    #[allow(clippy::unused_async)] // The real implementation will use async IO.
-    pub async fn exec_oneshot(&self, _req: ExecParams) -> Result<ExecOutcome> {
-        // TODO: implement via bollard create_container + start + attach + wait.
-        Err(crate::error::Error::Other("not yet implemented".into()))
+    pub async fn exec_oneshot(&self, req: ExecParams) -> Result<ExecOutcome> {
+        let start = Instant::now();
+        let container_id = self.create_container(&req).await?;
+
+        // Attach BEFORE start so we don't miss early output.
+        let attach = self
+            .docker
+            .attach_container::<String>(
+                &container_id,
+                Some(AttachContainerOptions {
+                    stdout: Some(true),
+                    stderr: Some(true),
+                    stream: Some(true),
+                    logs: Some(false),
+                    stdin: Some(false),
+                    detach_keys: None,
+                }),
+            )
+            .await?;
+
+        self.docker
+            .start_container::<String>(&container_id, None)
+            .await?;
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut attach_stream = attach.output;
+
+        let docker = &self.docker;
+        let cid = container_id.clone();
+
+        let collect = async {
+            while let Some(result) = attach_stream.next().await {
+                match result {
+                    Ok(LogOutput::StdOut { message }) => stdout.extend_from_slice(&message),
+                    Ok(LogOutput::StdErr { message }) => stderr.extend_from_slice(&message),
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        };
+
+        let wait = async {
+            let mut wait_stream = docker.wait_container(&cid, None::<WaitContainerOptions<String>>);
+            if let Some(Ok(resp)) = wait_stream.next().await {
+                resp.status_code
+            } else {
+                -1
+            }
+        };
+
+        let combined = async { tokio::join!(collect, wait) };
+
+        let timeout_result = tokio::time::timeout(req.timeout, combined).await;
+        let (exit_code, timed_out) = if let Ok(((), code)) = timeout_result {
+            (i32::try_from(code).unwrap_or(-1), false)
+        } else {
+            // AutoRemove fires on successful exit; after KILL the container may
+            // linger, so force-remove to be safe. Ignore errors — on some race
+            // conditions the container is already gone.
+            let _ = self
+                .docker
+                .kill_container(
+                    &container_id,
+                    Some(KillContainerOptions { signal: "SIGKILL" }),
+                )
+                .await;
+            let _ = self
+                .docker
+                .remove_container(
+                    &container_id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            (-1, true)
+        };
+
+        let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Ok(ExecOutcome {
+            exit_code,
+            stdout,
+            stderr,
+            duration_ms,
+            timed_out,
+        })
     }
+
+    /// Streaming variant. Returns the container id (so the caller can emit a
+    /// `Started` event) plus a stream that yields output chunks and a final
+    /// `Finished` event.
+    pub async fn exec_stream(
+        &self,
+        req: ExecParams,
+    ) -> Result<(
+        String,
+        Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>>,
+    )> {
+        let container_id = self.create_container(&req).await?;
+        let started_at = Instant::now();
+        let timeout = req.timeout;
+
+        let attach = self
+            .docker
+            .attach_container::<String>(
+                &container_id,
+                Some(AttachContainerOptions {
+                    stdout: Some(true),
+                    stderr: Some(true),
+                    stream: Some(true),
+                    logs: Some(false),
+                    stdin: Some(false),
+                    detach_keys: None,
+                }),
+            )
+            .await?;
+
+        self.docker
+            .start_container::<String>(&container_id, None)
+            .await?;
+
+        let docker = self.docker.clone();
+        let cid_for_stream = container_id.clone();
+
+        let stream = async_stream::stream! {
+            let mut attach_stream = attach.output;
+            let deadline = tokio::time::sleep(timeout);
+            tokio::pin!(deadline);
+
+            let mut timed_out = false;
+            loop {
+                tokio::select! {
+                    () = &mut deadline => {
+                        timed_out = true;
+                        break;
+                    }
+                    maybe = attach_stream.next() => match maybe {
+                        Some(Ok(LogOutput::StdOut { message })) => yield StreamEvent::Stdout(message),
+                        Some(Ok(LogOutput::StdErr { message })) => yield StreamEvent::Stderr(message),
+                        Some(Ok(_)) => {}
+                        Some(Err(_)) | None => break,
+                    }
+                }
+            }
+
+            if timed_out {
+                let _ = docker
+                    .kill_container(
+                        &cid_for_stream,
+                        Some(KillContainerOptions { signal: "SIGKILL" }),
+                    )
+                    .await;
+                let _ = docker
+                    .remove_container(
+                        &cid_for_stream,
+                        Some(RemoveContainerOptions { force: true, ..Default::default() }),
+                    )
+                    .await;
+                let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                yield StreamEvent::Finished { exit_code: -1, timed_out: true, duration_ms };
+                return;
+            }
+
+            // Normal exit — fetch the status code.
+            let mut wait_stream = docker.wait_container(
+                &cid_for_stream,
+                None::<WaitContainerOptions<String>>,
+            );
+            let exit_code = match wait_stream.next().await {
+                Some(Ok(resp)) => i32::try_from(resp.status_code).unwrap_or(-1),
+                _ => -1,
+            };
+            let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            yield StreamEvent::Finished { exit_code, timed_out: false, duration_ms };
+        };
+
+        Ok((container_id, Box::pin(stream)))
+    }
+
+    async fn create_container(&self, req: &ExecParams) -> Result<String> {
+        let host_path = req
+            .host_home_dir
+            .to_str()
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "non-UTF8 host home path: {}",
+                    req.host_home_dir.display()
+                ))
+            })?
+            .to_string();
+        let container_path = self
+            .sandbox_cfg
+            .workspace_mount
+            .to_string_lossy()
+            .into_owned();
+
+        let mut tmpfs: HashMap<String, String> = HashMap::new();
+        tmpfs.insert("/tmp".into(), format!("rw,size={}", req.tmpfs_bytes));
+
+        let host_config = HostConfig {
+            auto_remove: Some(true),
+            binds: Some(vec![format!("{host_path}:{container_path}")]),
+            memory: Some(i64::try_from(req.memory_bytes).unwrap_or(i64::MAX)),
+            nano_cpus: Some(i64::from(req.cpu_millis) * 1_000_000),
+            pids_limit: Some(i64::from(req.pids)),
+            readonly_rootfs: Some(true),
+            tmpfs: Some(tmpfs),
+            network_mode: Some("bridge".into()),
+            ..Default::default()
+        };
+
+        let env: Vec<String> = req.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+
+        let uid = self.sandbox_cfg.agent_uid;
+        let gid = self.sandbox_cfg.agent_gid;
+
+        let config = Config {
+            image: Some(req.image.clone()),
+            user: Some(format!("{uid}:{gid}")),
+            working_dir: Some(container_path.clone()),
+            cmd: Some(vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                req.command.clone(),
+            ]),
+            env: Some(env),
+            host_config: Some(host_config),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            tty: Some(false),
+            ..Default::default()
+        };
+
+        let options = Some(CreateContainerOptions {
+            name: container_name(&req.workspace_id),
+            platform: None,
+        });
+
+        let response = self.docker.create_container(options, config).await?;
+        Ok(response.id)
+    }
+}
+
+fn container_name(workspace_id: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0u64, |d| d.as_nanos() as u64);
+    format!("scriptorium-{workspace_id}-{nanos:x}")
 }
 
 /// Internal parameter bundle used by exec paths. Mirrors the gRPC
 /// `ExecRequest` but is decoupled from the protobuf types so the runtime is
 /// reusable if we ever add a non-gRPC interface.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExecParams {
     pub workspace_id: String,
     pub tenant_id: String,
@@ -96,4 +358,17 @@ pub struct ExecOutcome {
     pub stderr: Vec<u8>,
     pub duration_ms: u64,
     pub timed_out: bool,
+}
+
+/// Events produced by `exec_stream`, in order: zero or more Stdout/Stderr
+/// chunks, then exactly one Finished.
+#[derive(Debug)]
+pub enum StreamEvent {
+    Stdout(Bytes),
+    Stderr(Bytes),
+    Finished {
+        exit_code: i32,
+        timed_out: bool,
+        duration_ms: u64,
+    },
 }

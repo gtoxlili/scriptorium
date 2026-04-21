@@ -26,7 +26,7 @@ tokio = { version = "1", features = [
     "rt-multi-thread", "macros", "signal",
     "fs", "io-util", "net", "time", "sync", "process",
 ] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 async-stream = "0.3"
 futures = "0.3"
 bytes = "1"
@@ -60,6 +60,9 @@ path-clean = "1"
 [build-dependencies]
 tonic-build = "0.12"
 
+[dev-dependencies]
+tempfile = "3"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
@@ -84,3 +87,11 @@ match_same_arms = "allow"
 # Product names (OrbStack, Colima, Playwright, ...) in docs read better
 # without backtick fences; `doc_markdown` over-triggers on proper nouns.
 doc_markdown = "allow"
+# Timestamp arithmetic (u128 nanos → u64, u64 seconds → i64) is deliberate
+# — we only need uniqueness or valid-for-centuries epoch values.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+# tonic's Status is ~170 bytes; gRPC handlers unavoidably return
+# Result<_, Status>.
+result_large_err = "allow"
