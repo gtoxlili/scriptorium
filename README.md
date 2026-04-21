@@ -124,12 +124,37 @@ For example, Go:
 protoc --go_out=. --go-grpc_out=. proto/sandbox.proto
 ```
 
+## Integration testing
+
+`tests/e2e.rs` covers every RPC end-to-end against a real Docker daemon:
+
+- `Health` reachability
+- `Exec` — stdout/stderr capture, non-zero exit propagation, wall-clock
+  timeout, and persistent workspace state across calls
+- `ExecStream` — `Started`/chunk/`Finished` ordering
+- `PutFile` / `GetFile` — binary roundtrip with chunked streaming
+- `ListFiles` — recursive walk reflects exec-produced contents
+- `DeleteWorkspace` — host directory removal + idempotent repeat
+- Invalid `workspace_id` → `InvalidArgument`
+
+These tests are `#[ignore]`-gated so CI (no Docker) is unaffected. To run
+locally after building the sandbox image:
+
+```bash
+cargo test --test e2e -- --ignored --nocapture
+```
+
+Override the image tag via `SCRIPTORIUM_TEST_IMAGE=...` or the docker
+socket via `DOCKER_HOST=unix:///path/to/docker.sock` if you are not on
+OrbStack's default path.
+
 ## Status
 
-Scaffold + protocol. The gRPC service compiles and serves `Health` and
-`DeleteWorkspace` today; `Exec`, `ExecStream`, `PutFile`, `GetFile`, and
-`ListFiles` return `UNIMPLEMENTED` pending the bollard plumbing in
-`src/runtime.rs`. Issues and PRs welcome.
+The scaffold and protocol are stable; `Exec`, `ExecStream`, and workspace
+file I/O are implemented and exercised by the e2e suite. Follow-up work
+documented in [`docs/architecture.md`](docs/architecture.md) includes the
+optional warm-pool, automatic workspace GC, and mitmproxy-fronted egress
+allowlists. Issues and PRs welcome.
 
 ## License
 
