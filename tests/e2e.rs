@@ -383,6 +383,89 @@ async fn delete_workspace_removes_host_directory() {
     assert!(!resp.existed);
 }
 
+/// End-to-end against real TOS credentials. Writes an artifact in the
+/// sandbox via `Exec`, uploads via `UploadToOSS`, fetches the signed URL
+/// back, and asserts the body matches. Requires:
+///
+///   SCRIPTORIUM_TEST_TOS_ACCESS_KEY
+///   SCRIPTORIUM_TEST_TOS_SECRET_KEY
+///   SCRIPTORIUM_TEST_TOS_BUCKET
+///   SCRIPTORIUM_TEST_TOS_ENDPOINT   (optional, has cn-shanghai default)
+///   SCRIPTORIUM_TEST_TOS_REGION     (optional, has cn-shanghai default)
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker + scriptorium-sandbox image + real TOS creds"]
+async fn upload_to_oss_roundtrips_through_signed_url() {
+    if std::env::var("SCRIPTORIUM_TEST_TOS_ACCESS_KEY").is_err()
+        || std::env::var("SCRIPTORIUM_TEST_TOS_SECRET_KEY").is_err()
+        || std::env::var("SCRIPTORIUM_TEST_TOS_BUCKET").is_err()
+    {
+        eprintln!(
+            "skipping: set SCRIPTORIUM_TEST_TOS_ACCESS_KEY / _SECRET_KEY / _BUCKET to enable"
+        );
+        return;
+    }
+
+    let (addr, _tmp) = spawn_service().await;
+    let mut client = client(addr).await;
+
+    let ws = "oss-roundtrip";
+    let expected = b"hello from scriptorium e2e\n";
+
+    // 1. Produce an artifact inside the sandbox.
+    let exec_resp = client
+        .exec(ExecRequest {
+            workspace_id: ws.into(),
+            tenant_id: "e2e-tenant".into(),
+            command: format!(
+                "printf 'hello from scriptorium e2e\\n' > ~/artifact.txt && ls -la ~/artifact.txt"
+            ),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(exec_resp.exit_code, 0, "produce artifact failed");
+
+    // 2. Deliver.
+    let resp = client
+        .upload_to_oss(scriptorium::pb::UploadRequest {
+            workspace_id: ws.into(),
+            tenant_id: "e2e-tenant".into(),
+            source_path: "artifact.txt".into(),
+            compress: false,
+            ttl_seconds: 120,
+            label: "e2e-test".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.size_bytes, expected.len() as u64);
+    assert!(resp.object_key.contains("e2e-tenant"));
+    assert!(resp.object_key.contains(ws));
+    assert_eq!(resp.content_type, "text/plain; charset=utf-8");
+    assert!(!resp.sha256_hex.is_empty());
+    assert!(!resp.url.is_empty());
+
+    println!("object_key: {}", resp.object_key);
+    println!("sha256:     {}", resp.sha256_hex);
+    println!("url:        {}", resp.url);
+
+    // 3. Fetch via the signed URL and confirm private-read semantics hold.
+    let http_client = reqwest::Client::new();
+    let body = http_client
+        .get(&resp.url)
+        .send()
+        .await
+        .expect("signed url fetch")
+        .error_for_status()
+        .expect("signed url returned non-2xx")
+        .bytes()
+        .await
+        .expect("signed url body")
+        .to_vec();
+    assert_eq!(body.as_slice(), expected, "downloaded body does not match");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires local docker + scriptorium-sandbox image"]
 async fn list_tools_advertises_three_tools() {
