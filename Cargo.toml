@@ -91,9 +91,11 @@ tonic-build = "0.12"
 tempfile = "3"
 
 [profile.release]
-lto = "thin"
-codegen-units = 1
-strip = true
+opt-level = 3          # default for release, made explicit
+lto = "fat"            # whole-program; slower to link but tighter runtime
+codegen-units = 1      # single CGU enables more cross-function optimization
+strip = true           # drop debug info from the shipped binary
+panic = "abort"        # services don't unwind to recover; abort is smaller + faster
 
 # Lints are applied crate-wide via Cargo's unified lints section.
 # Pedantic is opt-in across modules — real-world exceptions are noted inline.

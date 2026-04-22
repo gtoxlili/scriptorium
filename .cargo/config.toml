@@ -1,0 +1,12 @@
+# Local build tuning. Applied automatically by cargo; this file is not a
+# cross-machine contract — CI runs on a different target triple (x86_64
+# Linux) and ignores this block.
+#
+# Docker builds (see docker/service.Dockerfile) set their own RUSTFLAGS
+# via `ENV` so the image-tuning stays out of here.
+
+[target.aarch64-apple-darwin]
+# `apple-m4` matches the Mac mini (M4 Pro). If you're running this on an
+# older Apple-Silicon box, downgrade to `apple-m3` / `apple-m2` / `apple-m1`
+# accordingly — or switch to `native`.
+rustflags = ["-C", "target-cpu=apple-m4"]

@@ -30,6 +30,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
 COPY proto ./proto
 COPY src ./src
+
+# Tune for whatever CPU this build host exposes. On OrbStack with a Mac
+# M-series host the builder sees the Apple CPU features, so the resulting
+# Linux binary picks them up automatically. If you rebuild on a different
+# host (Graviton, Ampere, etc.), the image gets tuned for that host's CPU.
+ENV RUSTFLAGS="-C target-cpu=native"
 RUN cargo build --release --locked --bin scriptorium
 
 # ─── Runtime ───────────────────────────────────────────────────────────
