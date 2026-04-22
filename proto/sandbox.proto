@@ -7,41 +7,54 @@ package scriptorium.v1;
 // and RPA workloads. Each call spins up a fresh container; persistent
 // state lives in an on-disk workspace keyed by an opaque caller-provided
 // identifier.
+//
+// Data flow philosophy: scriptorium is *not* a file transfer proxy.
+// Inputs come into the workspace via HTTP (`FetchIntoWorkspace`), outputs
+// are delivered via object storage (`UploadToOSS`). Callers never shuttle
+// raw bytes through gRPC — they move URLs.
 service Sandbox {
-  // Exec runs a shell command inside a freshly spawned sandbox container.
-  // The container is torn down when the call returns. Persistent state
-  // under the workspace directory survives.
+  // ─── Core exec ─────────────────────────────────────────────────────────
   rpc Exec(ExecRequest) returns (ExecResponse);
-
-  // ExecStream is the streaming variant that emits stdout/stderr in real time.
   rpc ExecStream(ExecRequest) returns (stream ExecEvent);
 
-  // PutFile writes a single file into the workspace directory (host-side
-  // filesystem operation; no container is spawned).
-  rpc PutFile(stream PutFileRequest) returns (PutFileResponse);
+  // ─── Workspace I/O (URL-based) ─────────────────────────────────────────
+  // FetchIntoWorkspace downloads an HTTP(S) URL directly into a workspace
+  // path. Host-side reqwest; SSRF-guarded against loopback / private CIDRs.
+  rpc FetchIntoWorkspace(FetchRequest) returns (FetchResponse);
 
-  // GetFile reads a single file from the workspace directory.
-  rpc GetFile(GetFileRequest) returns (stream GetFileChunk);
+  // UploadToOSS packages a workspace path (file or directory) and uploads
+  // it to the configured object store. Returns a signed download URL that
+  // the caller can hand to the end user as a delivery artifact.
+  rpc UploadToOSS(UploadRequest) returns (UploadResponse);
 
-  // ListFiles lists files under a workspace path.
+  // ListFiles enumerates a workspace directory. Helpful for LLMs that
+  // want to pick artifacts to deliver.
   rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
 
-  // DeleteWorkspace removes the entire workspace directory for a given id.
-  // Intended for admin/GC use, not for the LLM.
+  // ─── Lifecycle ─────────────────────────────────────────────────────────
   rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
-
-  // Health reports the service and docker-daemon status.
   rpc Health(HealthRequest) returns (HealthResponse);
+
+  // ─── AI-facing tool layer ──────────────────────────────────────────────
+  // ListTools advertises a compact, LLM-ready tool catalog (name,
+  // description, JSON Schema parameters). Callers that already wrap the
+  // primitives above can ignore it.
+  rpc ListTools(ListToolsRequest) returns (ListToolsResponse);
+
+  // CallTool dispatches a named tool against a workspace. Thin convenience
+  // layer over the primitives; streaming-heavy flows should use
+  // `ExecStream` directly.
+  rpc CallTool(CallToolRequest) returns (CallToolResponse);
 }
 
 // ─── Exec ──────────────────────────────────────────────────────────────────
 
 message ExecRequest {
   // Opaque caller-defined workspace identifier (e.g. a chat session id).
-  // Maps 1:1 to a persistent directory on disk. Must match [A-Za-z0-9_-]+.
+  // Must match [A-Za-z0-9_-]+, max 128 chars.
   string workspace_id = 1;
 
-  // Tenant identifier — used for audit logging. Free-form, not validated.
+  // Tenant identifier — used for audit logging and OSS key namespacing.
   string tenant_id = 2;
 
   // Shell command to execute inside the container, via `bash -lc`.
@@ -53,7 +66,7 @@ message ExecRequest {
   // Additional environment variables to inject.
   map<string, string> env = 5;
 
-  // Optional image override. Empty = server default (the fat sandbox image).
+  // Optional image override. Empty = server default.
   string image = 6;
 
   // Optional resource limits override.
@@ -92,40 +105,47 @@ message ExecFinished {
   bool timed_out = 3;
 }
 
-// ─── Workspace file I/O ────────────────────────────────────────────────────
+// ─── Fetch / Upload / List ─────────────────────────────────────────────────
 
-message PutFileRequest {
-  // The first message must carry `header`; subsequent messages carry `chunk`.
-  oneof payload {
-    PutFileHeader header = 1;
-    bytes chunk = 2;
-  }
-}
-message PutFileHeader {
+message FetchRequest {
   string workspace_id = 1;
-  // Path relative to the workspace root (e.g. "inputs/a.csv"). Traversal
-  // (`..`, absolute paths) is rejected server-side.
-  string path = 2;
-  // Unix mode bits (lower 9 bits). 0 = default 0644.
-  uint32 mode = 3;
+  string tenant_id = 2;
+  // HTTP(S) URL. Loopback/private CIDRs are rejected unless explicitly
+  // allowlisted in server config.
+  string url = 3;
+  // Path relative to the workspace root. Parent dirs are created as needed.
+  string target_path = 4;
+  // Optional headers (auth, UA overrides, etc.).
+  map<string, string> headers = 5;
+  // Wall-clock timeout for the whole fetch. 0 = server default.
+  uint32 timeout_seconds = 6;
 }
-message PutFileResponse {
+message FetchResponse {
   uint64 bytes_written = 1;
+  string content_type = 2;
+  int32 http_status = 3;
 }
 
-message GetFileRequest {
+message UploadRequest {
   string workspace_id = 1;
-  string path = 2;
+  string tenant_id = 2;
+  // Workspace-relative path. Directories are tar.gz'd automatically; files
+  // are uploaded as-is unless `compress = true`.
+  string source_path = 3;
+  bool compress = 4;
+  // Signed URL TTL in seconds. 0 = server default. Clamped server-side.
+  uint32 ttl_seconds = 5;
+  // Optional human-readable label stored as object metadata.
+  string label = 6;
 }
-message GetFileChunk {
-  oneof payload {
-    GetFileHeader header = 1;
-    bytes chunk = 2;
-  }
-}
-message GetFileHeader {
-  uint64 size_bytes = 1;
-  uint32 mode = 2;
+message UploadResponse {
+  // Signed download URL. Expires after `ttl_seconds`.
+  string url = 1;
+  // Full object key for audit (bucket-relative).
+  string object_key = 2;
+  uint64 size_bytes = 3;
+  string content_type = 4;
+  string sha256_hex = 5;
 }
 
 message ListFilesRequest {
@@ -159,4 +179,42 @@ message HealthResponse {
   string version = 1;
   string docker_version = 2;
   bool docker_reachable = 3;
+  // Available permits in the exec concurrency semaphore.
+  uint32 exec_permits_available = 4;
+}
+
+// ─── AI-facing tool layer ──────────────────────────────────────────────────
+
+message ListToolsRequest {}
+message ListToolsResponse {
+  repeated ToolDescriptor tools = 1;
+}
+
+message ToolDescriptor {
+  // Stable tool identifier (e.g. "execute_shell"). LLM callers route on this.
+  string name = 1;
+  // Prose description, LLM-facing.
+  string description = 2;
+  // JSON Schema for arguments (as a JSON string). Compatible with the
+  // OpenAI function-call / MCP tool-descriptor shape.
+  string parameters_schema = 3;
+}
+
+message CallToolRequest {
+  string workspace_id = 1;
+  string tenant_id = 2;
+  string tool_name = 3;
+  // Tool arguments as a JSON object (string-encoded to avoid dragging a
+  // Struct dependency into the proto).
+  string arguments_json = 4;
+  // Optional per-call timeout override.
+  uint32 timeout_seconds = 5;
+}
+message CallToolResponse {
+  // Tool result as a JSON object. Shape depends on the tool — see the
+  // descriptor returned by ListTools.
+  string result_json = 1;
+  bool is_error = 2;
+  // Populated when `is_error = true`; plain-text error suitable for LLM.
+  string error_message = 3;
 }

@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
 
     let runtime = DockerRuntime::connect(cfg.docker.clone(), cfg.sandbox.clone()).await?;
 
-    let svc = SandboxService::new(runtime, workspaces);
+    let svc = SandboxService::new(runtime, workspaces, &cfg.concurrency);
 
     let addr = cfg.server.listen;
     tracing::info!(%addr, "gRPC server listening");

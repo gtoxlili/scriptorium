@@ -8,16 +8,18 @@
 //!   2. The `scriptorium-sandbox:debian12-v1` image (built via
 //!      `docker build -f docker/sandbox.Dockerfile -t scriptorium-sandbox:debian12-v1 .`).
 //!
+//! Tests that also need TOS credentials use the `SCRIPTORIUM_TEST_TOS=1`
+//! env guard on top of that — see individual test docs.
+//!
 //! Run with `cargo test --test e2e -- --ignored --nocapture`.
 #![allow(clippy::doc_markdown)]
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use scriptorium::{
-    config::{DockerConfig, SandboxConfig, WorkspaceConfig},
+    config::{ConcurrencyConfig, DockerConfig, SandboxConfig, WorkspaceConfig},
     pb::{
-        DeleteWorkspaceRequest, ExecRequest, GetFileRequest, HealthRequest, ListFilesRequest,
-        PutFileHeader, PutFileRequest, exec_event, get_file_chunk, put_file_request,
+        DeleteWorkspaceRequest, ExecRequest, HealthRequest, ListFilesRequest, exec_event,
         sandbox_client::SandboxClient, sandbox_server::SandboxServer,
     },
     runtime::DockerRuntime,
@@ -54,6 +56,13 @@ fn sandbox_cfg_for_tests() -> SandboxConfig {
     }
 }
 
+fn concurrency_cfg_for_tests() -> ConcurrencyConfig {
+    ConcurrencyConfig {
+        max_concurrent_execs: 4,
+        exec_queue_timeout_seconds: 10,
+    }
+}
+
 /// Boot an in-process SandboxService listening on a random port. Returns
 /// (`bound_addr`, `tmp_root`); dropping `tmp_root` wipes the workspace state.
 async fn spawn_service() -> (SocketAddr, TempDir) {
@@ -72,7 +81,7 @@ async fn spawn_service() -> (SocketAddr, TempDir) {
         .expect("docker connect");
     let workspaces = WorkspaceManager::new(workspace_cfg);
     workspaces.ensure_root().await.expect("ensure_root");
-    let svc = SandboxService::new(runtime, workspaces);
+    let svc = SandboxService::new(runtime, workspaces, &concurrency_cfg_for_tests());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -108,7 +117,11 @@ async fn health_reports_docker_reachable() {
     let resp = client.health(HealthRequest {}).await.unwrap().into_inner();
     assert!(resp.docker_reachable, "docker must be reachable");
     assert!(!resp.version.is_empty());
-    println!("docker_version = {}", resp.docker_version);
+    assert!(resp.exec_permits_available > 0);
+    println!(
+        "docker_version = {}, permits = {}",
+        resp.docker_version, resp.exec_permits_available
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -248,65 +261,6 @@ async fn exec_stream_emits_started_chunks_finished() {
         }
     }
     assert_eq!(concatenated, b"a\nb\nc\n");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires local docker + scriptorium-sandbox image"]
-async fn put_then_get_file_roundtrips_contents() {
-    let (addr, _tmp) = spawn_service().await;
-    let mut client = client(addr).await;
-
-    let payload: Vec<u8> = (0u8..=250).cycle().take(200_000).collect();
-    let ws = "io";
-    let path = "inputs/a.bin";
-
-    // PutFile
-    let header_msg = PutFileRequest {
-        payload: Some(put_file_request::Payload::Header(PutFileHeader {
-            workspace_id: ws.into(),
-            path: path.into(),
-            mode: 0o644,
-        })),
-    };
-    let chunk_msgs: Vec<PutFileRequest> = payload
-        .chunks(8192)
-        .map(|c| PutFileRequest {
-            payload: Some(put_file_request::Payload::Chunk(c.to_vec())),
-        })
-        .collect();
-    let mut messages = Vec::with_capacity(chunk_msgs.len() + 1);
-    messages.push(header_msg);
-    messages.extend(chunk_msgs);
-    let stream = tokio_stream::iter(messages);
-    let resp = client.put_file(stream).await.unwrap().into_inner();
-    assert_eq!(resp.bytes_written, payload.len() as u64);
-
-    // GetFile
-    let mut stream = client
-        .get_file(GetFileRequest {
-            workspace_id: ws.into(),
-            path: path.into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-
-    let mut saw_header = false;
-    let mut buf = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.unwrap();
-        match chunk.payload {
-            Some(get_file_chunk::Payload::Header(h)) => {
-                saw_header = true;
-                assert_eq!(h.size_bytes, payload.len() as u64);
-                assert_eq!(h.mode & 0o777, 0o644);
-            }
-            Some(get_file_chunk::Payload::Chunk(data)) => buf.extend_from_slice(&data),
-            None => {}
-        }
-    }
-    assert!(saw_header, "header must arrive");
-    assert_eq!(buf, payload);
 }
 
 #[tokio::test(flavor = "multi_thread")]

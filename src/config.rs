@@ -14,6 +14,11 @@ pub struct Config {
     pub docker: DockerConfig,
     pub sandbox: SandboxConfig,
     pub workspace: WorkspaceConfig,
+    pub tos: TosConfig,
+    #[serde(default)]
+    pub concurrency: ConcurrencyConfig,
+    #[serde(default)]
+    pub fetch: FetchConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,6 +103,111 @@ pub struct WorkspaceConfig {
     pub root: PathBuf,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct TosConfig {
+    /// S3-compatible endpoint. For Volcano Engine TOS this is typically
+    /// `https://tos-s3-cn-{region}.volces.com`.
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    pub access_key: String,
+    pub secret_key: String,
+    /// Prefix prepended to all scriptorium-generated object keys. Keeps
+    /// sandbox artifacts separate from other producers in the same bucket.
+    #[serde(default = "default_tos_prefix")]
+    pub key_prefix: String,
+    /// Default lifetime for signed download URLs.
+    #[serde(default = "default_signed_url_expires")]
+    pub signed_url_expires_seconds: u32,
+    /// Max signed URL lifetime; requests asking for more are clamped.
+    #[serde(default = "default_signed_url_max")]
+    pub signed_url_max_seconds: u32,
+    /// Multipart upload chunk size. Matches aws-sdk-s3 default.
+    #[serde(default = "default_part_size")]
+    pub part_size_bytes: u64,
+    /// Upload total-wall timeout.
+    #[serde(default = "default_upload_timeout")]
+    pub upload_timeout_seconds: u64,
+}
+
+fn default_tos_prefix() -> String {
+    "sandbox/".to_string()
+}
+fn default_signed_url_expires() -> u32 {
+    3600
+}
+fn default_signed_url_max() -> u32 {
+    86400
+}
+fn default_part_size() -> u64 {
+    8 * 1024 * 1024
+}
+fn default_upload_timeout() -> u64 {
+    300
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ConcurrencyConfig {
+    /// Hard cap on simultaneously running containers spawned by `Exec` and
+    /// `ExecStream`. Requests beyond this queue (up to `queue_timeout`).
+    /// 0 = derive a default from available CPU/memory (currently: 4).
+    #[serde(default)]
+    pub max_concurrent_execs: u32,
+    /// Time a queued exec will wait for a permit before returning
+    /// `RESOURCE_EXHAUSTED`. 0 = queue indefinitely.
+    #[serde(default)]
+    pub exec_queue_timeout_seconds: u32,
+}
+
+impl ConcurrencyConfig {
+    pub fn effective_max(&self) -> usize {
+        if self.max_concurrent_execs == 0 {
+            4
+        } else {
+            self.max_concurrent_execs as usize
+        }
+    }
+
+    pub fn effective_queue_timeout(&self) -> Option<std::time::Duration> {
+        if self.exec_queue_timeout_seconds == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(u64::from(
+                self.exec_queue_timeout_seconds,
+            )))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FetchConfig {
+    #[serde(default = "default_fetch_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_fetch_max_body")]
+    pub max_body_bytes: u64,
+    /// When true, URLs resolving to loopback / RFC1918 ranges are allowed.
+    /// Default false — the service rejects them as SSRF.
+    #[serde(default)]
+    pub allow_private_network: bool,
+}
+
+impl Default for FetchConfig {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: default_fetch_timeout(),
+            max_body_bytes: default_fetch_max_body(),
+            allow_private_network: false,
+        }
+    }
+}
+
+fn default_fetch_timeout() -> u64 {
+    60
+}
+fn default_fetch_max_body() -> u64 {
+    1024 * 1024 * 1024 // 1 GiB
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)?;
@@ -130,6 +240,11 @@ impl Config {
                 socket = %self.docker.socket.display(),
                 "docker socket does not exist at startup — service will fail to reach the daemon"
             );
+        }
+        if self.tos.endpoint.is_empty() || self.tos.bucket.is_empty() {
+            return Err(Error::Other(
+                "tos.endpoint and tos.bucket are required".into(),
+            ));
         }
         Ok(())
     }

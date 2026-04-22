@@ -2,45 +2,73 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     pin::Pin,
+    sync::Arc,
     time::Duration,
 };
 
 use futures::{Stream, StreamExt, stream};
-use tokio::{
-    fs,
-    io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
-};
-use tonic::{Request, Response, Status, Streaming};
+use tokio::{fs, sync::Semaphore};
+use tonic::{Request, Response, Status};
 
 use crate::{
+    config::ConcurrencyConfig,
     error::{Error, Result},
     pb::{
-        DeleteWorkspaceRequest, DeleteWorkspaceResponse, ExecEvent, ExecFinished, ExecRequest,
-        ExecResponse, ExecStarted, FileInfo, GetFileChunk, GetFileRequest, HealthRequest,
-        HealthResponse, ListFilesRequest, ListFilesResponse, PutFileRequest, PutFileResponse,
-        ResourceLimits, StderrChunk, StdoutChunk, exec_event, get_file_chunk, put_file_request,
-        sandbox_server::Sandbox,
+        CallToolRequest, CallToolResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
+        ExecEvent, ExecFinished, ExecRequest, ExecResponse, ExecStarted, FetchRequest,
+        FetchResponse, FileInfo, HealthRequest, HealthResponse, ListFilesRequest,
+        ListFilesResponse, ListToolsRequest, ListToolsResponse, ResourceLimits, StderrChunk,
+        StdoutChunk, UploadRequest, UploadResponse, exec_event, sandbox_server::Sandbox,
     },
     runtime::{DockerRuntime, ExecParams, StreamEvent},
     workspace::WorkspaceManager,
 };
 
-// 64 KiB — keeps us well under the default gRPC max-message size (4 MiB)
-// while avoiding tiny-chunk overhead.
-const FILE_CHUNK_BYTES: usize = 64 * 1024;
-
 #[derive(Debug)]
 pub struct SandboxService {
     runtime: DockerRuntime,
     workspaces: WorkspaceManager,
+    exec_permits: Arc<Semaphore>,
+    exec_queue_timeout: Option<Duration>,
+    exec_permit_capacity: usize,
 }
 
 impl SandboxService {
-    pub fn new(runtime: DockerRuntime, workspaces: WorkspaceManager) -> Self {
+    pub fn new(
+        runtime: DockerRuntime,
+        workspaces: WorkspaceManager,
+        concurrency: &ConcurrencyConfig,
+    ) -> Self {
+        let capacity = concurrency.effective_max();
         Self {
             runtime,
             workspaces,
+            exec_permits: Arc::new(Semaphore::new(capacity)),
+            exec_queue_timeout: concurrency.effective_queue_timeout(),
+            exec_permit_capacity: capacity,
         }
+    }
+
+    /// Acquire a permit for a container-spawning operation, queued against
+    /// the configured timeout. Dropping the returned guard releases the
+    /// permit automatically.
+    async fn acquire_exec_permit(&self) -> std::result::Result<OwnedExecPermit, Status> {
+        let acquire = self.exec_permits.clone().acquire_owned();
+        let permit = match self.exec_queue_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, acquire).await.map_err(|_| {
+                Status::resource_exhausted(format!(
+                    "exec queue full (cap={}); retry with backoff",
+                    self.exec_permit_capacity
+                ))
+            })?,
+            None => acquire.await,
+        }
+        .map_err(|_| Status::internal("exec semaphore closed"))?;
+        Ok(OwnedExecPermit { _permit: permit })
+    }
+
+    fn exec_permits_available(&self) -> u32 {
+        u32::try_from(self.exec_permits.available_permits()).unwrap_or(u32::MAX)
     }
 
     /// Translate a gRPC `ExecRequest` into the runtime's internal
@@ -108,10 +136,14 @@ impl SandboxService {
     }
 }
 
+/// Holds a semaphore permit for the lifetime of an exec call. Dropped at
+/// the end of the handler scope.
+struct OwnedExecPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
 type ExecStreamOut =
     Pin<Box<dyn Stream<Item = std::result::Result<ExecEvent, Status>> + Send + 'static>>;
-type GetFileStreamOut =
-    Pin<Box<dyn Stream<Item = std::result::Result<GetFileChunk, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
 impl Sandbox for SandboxService {
@@ -119,8 +151,10 @@ impl Sandbox for SandboxService {
         &self,
         req: Request<ExecRequest>,
     ) -> std::result::Result<Response<ExecResponse>, Status> {
+        let permit = self.acquire_exec_permit().await?;
         let params = self.build_exec_params(req.into_inner()).await?;
         let outcome = self.runtime.exec_oneshot(params).await?;
+        drop(permit);
         Ok(Response::new(ExecResponse {
             exit_code: outcome.exit_code,
             stdout: outcome.stdout,
@@ -135,6 +169,7 @@ impl Sandbox for SandboxService {
         &self,
         req: Request<ExecRequest>,
     ) -> std::result::Result<Response<Self::ExecStreamStream>, Status> {
+        let permit = self.acquire_exec_permit().await?;
         let params = self.build_exec_params(req.into_inner()).await?;
         let (container_id, events) = self.runtime.exec_stream(params).await?;
 
@@ -143,7 +178,10 @@ impl Sandbox for SandboxService {
                 event: Some(exec_event::Event::Started(ExecStarted { container_id })),
             })
         });
-        let rest = events.map(|ev| {
+        // Move the permit into the stream so it's released only when the
+        // final Finished event is drained.
+        let rest = events.map(move |ev| {
+            let _keep_permit_alive = &permit;
             Ok(match ev {
                 StreamEvent::Stdout(data) => ExecEvent {
                     event: Some(exec_event::Event::Stdout(StdoutChunk {
@@ -171,123 +209,24 @@ impl Sandbox for SandboxService {
         Ok(Response::new(Box::pin(started.chain(rest)) as ExecStreamOut))
     }
 
-    async fn put_file(
+    async fn fetch_into_workspace(
         &self,
-        req: Request<Streaming<PutFileRequest>>,
-    ) -> std::result::Result<Response<PutFileResponse>, Status> {
-        let mut inbound = req.into_inner();
-
-        // First message must carry the header.
-        let header = match inbound.next().await {
-            Some(Ok(PutFileRequest {
-                payload: Some(put_file_request::Payload::Header(h)),
-            })) => h,
-            Some(Ok(_)) => {
-                return Err(Status::invalid_argument(
-                    "put_file: first message must be a header",
-                ));
-            }
-            Some(Err(status)) => return Err(status),
-            None => return Err(Status::invalid_argument("put_file: empty stream")),
-        };
-
-        let sandbox = self.runtime.sandbox_cfg();
-        self.workspaces
-            .ensure_home(&header.workspace_id, sandbox.agent_uid, sandbox.agent_gid)
-            .await?;
-        let target = self
-            .workspaces
-            .resolve_path(&header.workspace_id, &header.path)?;
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).await.map_err(Error::from)?;
-        }
-
-        // Delete any pre-existing file so an entry owned by a previous
-        // exec's container UID doesn't block the server (running as a
-        // different UID) from recreating it.
-        match fs::remove_file(&target).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(Error::from(e).into()),
-        }
-
-        let file = fs::File::create(&target).await.map_err(Error::from)?;
-        let mut writer = BufWriter::new(file);
-        let mut bytes_written: u64 = 0;
-
-        while let Some(chunk) = inbound.next().await {
-            let chunk = chunk?;
-            match chunk.payload {
-                Some(put_file_request::Payload::Chunk(data)) => {
-                    writer.write_all(&data).await.map_err(Error::from)?;
-                    bytes_written += data.len() as u64;
-                }
-                Some(put_file_request::Payload::Header(_)) => {
-                    return Err(Status::invalid_argument("put_file: header sent twice"));
-                }
-                None => {}
-            }
-        }
-        writer.flush().await.map_err(Error::from)?;
-        writer.into_inner().sync_all().await.map_err(Error::from)?;
-
-        // Permissions are set to a mode that lets the container user read
-        // (`o+r`) — we can't chown to the container UID on non-root hosts,
-        // so we rely on the "other" bit. 0644 is the default.
-        let mode = if header.mode == 0 {
-            0o644
-        } else {
-            header.mode & 0o777
-        };
-        fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
-            .await
-            .map_err(Error::from)?;
-        // `sandbox` kept as an explicit binding so future work can reach
-        // back to config without re-plumbing — currently unused here.
-        let _ = sandbox;
-
-        Ok(Response::new(PutFileResponse { bytes_written }))
+        _req: Request<FetchRequest>,
+    ) -> std::result::Result<Response<FetchResponse>, Status> {
+        // Wired in a subsequent commit (host-side reqwest + SSRF guard).
+        Err(Status::unimplemented(
+            "fetch_into_workspace: pending implementation",
+        ))
     }
 
-    type GetFileStream = GetFileStreamOut;
-    async fn get_file(
+    async fn upload_to_oss(
         &self,
-        req: Request<GetFileRequest>,
-    ) -> std::result::Result<Response<Self::GetFileStream>, Status> {
-        let inner = req.into_inner();
-        let target = self
-            .workspaces
-            .resolve_path(&inner.workspace_id, &inner.path)?;
-
-        let meta = fs::metadata(&target).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                Status::not_found(format!("no such file: {}", inner.path))
-            } else {
-                Status::from(Error::Io(e))
-            }
-        })?;
-        if meta.is_dir() {
-            return Err(Status::invalid_argument(format!(
-                "{} is a directory",
-                inner.path
-            )));
-        }
-
-        let size_bytes = meta.len();
-        let mode = meta.permissions().mode() & 0o7777;
-        let header_chunk = GetFileChunk {
-            payload: Some(get_file_chunk::Payload::Header(crate::pb::GetFileHeader {
-                size_bytes,
-                mode,
-            })),
-        };
-
-        let file = fs::File::open(&target).await.map_err(Error::from)?;
-        let reader = BufReader::new(file);
-
-        let body = stream_file_chunks(reader);
-        let full = stream::once(async move { Ok(header_chunk) }).chain(body);
-        Ok(Response::new(Box::pin(full) as GetFileStreamOut))
+        _req: Request<UploadRequest>,
+    ) -> std::result::Result<Response<UploadResponse>, Status> {
+        // Wired in a subsequent commit (aws-sdk-s3 against TOS endpoint).
+        Err(Status::unimplemented(
+            "upload_to_oss: pending implementation",
+        ))
     }
 
     async fn list_files(
@@ -336,33 +275,24 @@ impl Sandbox for SandboxService {
             version: env!("CARGO_PKG_VERSION").to_string(),
             docker_version,
             docker_reachable,
+            exec_permits_available: self.exec_permits_available(),
         }))
     }
-}
 
-/// Read a file in chunked payloads until EOF.
-fn stream_file_chunks(
-    reader: BufReader<fs::File>,
-) -> Pin<Box<dyn Stream<Item = std::result::Result<GetFileChunk, Status>> + Send + 'static>> {
-    Box::pin(async_stream::stream! {
-        let mut reader = reader;
-        let mut buf = vec![0u8; FILE_CHUNK_BYTES];
-        loop {
-            let n = match reader.read(&mut buf).await {
-                Ok(n) => n,
-                Err(e) => {
-                    yield Err(Status::from(Error::Io(e)));
-                    return;
-                }
-            };
-            if n == 0 {
-                break;
-            }
-            yield Ok(GetFileChunk {
-                payload: Some(get_file_chunk::Payload::Chunk(buf[..n].to_vec())),
-            });
-        }
-    })
+    async fn list_tools(
+        &self,
+        _req: Request<ListToolsRequest>,
+    ) -> std::result::Result<Response<ListToolsResponse>, Status> {
+        // Wired in a subsequent commit (tool registry).
+        Err(Status::unimplemented("list_tools: pending implementation"))
+    }
+
+    async fn call_tool(
+        &self,
+        _req: Request<CallToolRequest>,
+    ) -> std::result::Result<Response<CallToolResponse>, Status> {
+        Err(Status::unimplemented("call_tool: pending implementation"))
+    }
 }
 
 /// Recursive (or single-level) directory walk, yielding `FileInfo` entries

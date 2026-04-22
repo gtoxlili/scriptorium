@@ -26,3 +26,32 @@ workspace_mount = "/home/agent"
 # Where per-workspace persistent state lives on the host. Point this at the
 # external SSD. Each workspace_id becomes a direct child directory.
 root = "/Volumes/external/scriptorium-state"
+
+[tos]
+# S3-compatible object storage. Defaults target Volcano Engine TOS; set
+# endpoint + region for the region you actually use. Credentials come from
+# the file or (preferred) from env vars the deployer expands into this TOML.
+endpoint                   = "https://tos-s3-cn-shanghai.volces.com"
+region                     = "cn-shanghai"
+bucket                     = "your-bucket"
+access_key                 = "${TOS_ACCESS_KEY}"
+secret_key                 = "${TOS_SECRET_KEY}"
+key_prefix                 = "sandbox/"
+signed_url_expires_seconds = 3600      # 1 h default for `deliver` URLs
+signed_url_max_seconds     = 86400     # clamp hard to 24 h
+part_size_bytes            = 8388608   # 8 MiB
+upload_timeout_seconds     = 300
+
+[concurrency]
+# Hard cap on simultaneously running exec containers. Requests beyond this
+# queue for at most `exec_queue_timeout_seconds` then return
+# RESOURCE_EXHAUSTED. 0 on either field uses server defaults (4 / 30 s).
+max_concurrent_execs       = 4
+exec_queue_timeout_seconds = 30
+
+[fetch]
+# URL-ingress controls for `FetchIntoWorkspace`. Private CIDRs and loopback
+# are rejected by default as basic SSRF defence.
+timeout_seconds       = 60
+max_body_bytes        = 1073741824  # 1 GiB
+allow_private_network = false
