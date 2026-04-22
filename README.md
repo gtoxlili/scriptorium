@@ -134,29 +134,63 @@ docs/architecture.md        Design decisions and boundaries
 
 ## Deployment
 
-Two supported shapes. On macOS, **Docker Compose is preferred** — the
-service inherits OrbStack's already-granted access to external volumes,
-so no TCC prompt each time the service reads from a mounted SSD. On
-Linux, either shape works; native binary + systemd is usually simpler.
+On macOS, **running in Docker is preferred** — the service inherits
+OrbStack's already-granted access to external volumes, so no TCC prompt
+each time it reads from a mounted SSD. On Linux, either shape works;
+native binary + systemd is usually simpler.
 
-### Docker Compose (recommended on macOS)
+### Docker (recommended on macOS)
 
 ```bash
-cp .env.example .env              # then edit SCRIPTORIUM_WORKSPACE_ROOT
+# 1. Prepare config (TOS creds + workspace root)
 cp deploy/config.example.toml deploy/config.toml
-# Edit deploy/config.toml — fill [tos] credentials, confirm [workspace].root
-# matches SCRIPTORIUM_WORKSPACE_ROOT in .env. Set docker.socket = "/var/run/docker.sock"
-# (the compose file mounts OrbStack's socket there).
-chmod 600 deploy/config.toml      # TOS creds — don't leave this world-readable
+# Edit deploy/config.toml — fill [tos].access_key / .secret_key and set
+# [workspace].root to the ABSOLUTE host path (e.g. /Volumes/SSD/scriptorium-state).
+# Leave [docker].socket = "/var/run/docker.sock" — the run command below
+# mounts OrbStack's real socket at that path.
+chmod 600 deploy/config.toml      # TOS creds — don't leave world-readable
 
-docker compose up -d --build      # first build ~1-2 min; incremental seconds
-docker compose logs -f            # tail logs
-docker compose down               # stop + remove
+# 2. Build service image (first time ~1-2 min; incremental ~seconds)
+docker build -f docker/service.Dockerfile -t scriptorium:latest .
+
+# 3. Run it. WS_ROOT MUST match [workspace].root in config.toml exactly —
+#    the bind-mount maps the same absolute path on both sides so
+#    sandbox-container bind paths resolve against the host daemon.
+WS_ROOT=/Volumes/SSD/scriptorium-state     # <— edit to match your SSD
+docker run -d \
+  --name scriptorium \
+  --restart=unless-stopped \
+  -p 127.0.0.1:50051:50051 \
+  -v "$HOME/.orbstack/run/docker.sock:/var/run/docker.sock" \
+  -v "$WS_ROOT:$WS_ROOT" \
+  -v "$(pwd)/deploy/config.toml:/etc/scriptorium/config.toml:ro" \
+  -e RUST_LOG="info,bollard=warn" \
+  scriptorium:latest
 ```
 
-The gRPC server is exposed on `127.0.0.1:50051`. OrbStack handles both
-the nested Docker socket (scriptorium spawns sandbox containers via the
-host daemon) and the file-sharing layer for the workspace bind-mount.
+Control:
+
+```bash
+docker logs -f scriptorium        # tail
+docker restart scriptorium        # after editing config.toml
+docker rm -f scriptorium          # stop + remove
+
+# After Rust code changes: rebuild image and re-run
+docker build -f docker/service.Dockerfile -t scriptorium:latest .
+docker rm -f scriptorium
+docker run -d … scriptorium:latest   # (same flags as above)
+```
+
+### Docker Compose (alternative)
+
+A `docker-compose.yml` is also provided. Copy `.env.example` to `.env`,
+set `SCRIPTORIUM_WORKSPACE_ROOT`, then:
+
+```bash
+docker compose up -d --build
+docker compose logs -f
+docker compose down
+```
 
 ### Native binary
 
@@ -168,9 +202,9 @@ cp deploy/config.example.toml deploy/config.toml
 ./target/release/scriptorium --config deploy/config.toml
 ```
 
-For a long-running service under `launchd`, see `docs/architecture.md`.
-Note that native runs on macOS can trigger TCC prompts for external
-volumes — the Docker deployment sidesteps that.
+For a long-running launchd service, see `docs/architecture.md`. Note
+that launchd-managed native processes on macOS can trigger TCC prompts
+for external volumes — the Docker path sidesteps that.
 
 ## Build the sandbox image
 
