@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     pin::Pin,
@@ -23,6 +24,7 @@ use crate::{
         StdoutChunk, UploadRequest, UploadResponse, exec_event, sandbox_server::Sandbox,
     },
     runtime::{DockerRuntime, ExecParams, StreamEvent},
+    tools,
     workspace::WorkspaceManager,
 };
 
@@ -57,9 +59,8 @@ impl SandboxService {
         }
     }
 
-    /// Acquire a permit for a container-spawning operation, queued against
-    /// the configured timeout. Dropping the returned guard releases the
-    /// permit automatically.
+    // ─── Permit machinery ─────────────────────────────────────────────────
+
     async fn acquire_exec_permit(&self) -> std::result::Result<OwnedExecPermit, Status> {
         let acquire = self.exec_permits.clone().acquire_owned();
         let permit = match self.exec_queue_timeout {
@@ -79,8 +80,13 @@ impl SandboxService {
         u32::try_from(self.exec_permits.available_permits()).unwrap_or(u32::MAX)
     }
 
-    /// Translate a gRPC `ExecRequest` into the runtime's internal
-    /// `ExecParams`, applying server-side defaults for any zero/empty fields.
+    // ─── Core helpers ─────────────────────────────────────────────────────
+    //
+    // The three `do_*` functions are the implementation truth. Both the
+    // primitive RPCs (Exec / FetchIntoWorkspace / UploadToOSS) and the
+    // tool-layer RPCs (CallTool) call into them, so the behaviour cannot
+    // drift between the two surfaces.
+
     async fn build_exec_params(&self, req: ExecRequest) -> Result<ExecParams> {
         let sandbox = self.runtime.sandbox_cfg();
 
@@ -142,6 +148,128 @@ impl SandboxService {
             tmpfs_bytes,
         })
     }
+
+    async fn do_exec_oneshot(&self, req: ExecRequest) -> std::result::Result<ExecResponse, Status> {
+        let permit = self.acquire_exec_permit().await?;
+        let params = self.build_exec_params(req).await?;
+        let outcome = self.runtime.exec_oneshot(params).await?;
+        drop(permit);
+        Ok(ExecResponse {
+            exit_code: outcome.exit_code,
+            stdout: outcome.stdout,
+            stderr: outcome.stderr,
+            duration_ms: outcome.duration_ms,
+            timed_out: outcome.timed_out,
+        })
+    }
+
+    async fn do_fetch(
+        &self,
+        workspace_id: &str,
+        url: &str,
+        target_path: &str,
+        headers: &HashMap<String, String>,
+        timeout_seconds: u32,
+    ) -> std::result::Result<FetchResponse, Status> {
+        let sandbox = self.runtime.sandbox_cfg();
+        self.workspaces
+            .ensure_home(workspace_id, sandbox.agent_uid, sandbox.agent_gid)
+            .await?;
+        let target = self.workspaces.resolve_path(workspace_id, target_path)?;
+
+        let timeout = if timeout_seconds == 0 {
+            Duration::from_secs(self.fetch_cfg.timeout_seconds)
+        } else {
+            Duration::from_secs(u64::from(timeout_seconds))
+        };
+
+        let outcome = fetch_to_file(&self.fetch_cfg, url, &target, headers, timeout).await?;
+
+        // Make the downloaded file world-readable (container UID needs
+        // `o+r` since we can't chown on non-root hosts).
+        fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
+            .await
+            .map_err(Error::from)?;
+
+        Ok(FetchResponse {
+            bytes_written: outcome.bytes_written,
+            content_type: outcome.content_type,
+            http_status: i32::from(outcome.http_status),
+        })
+    }
+
+    async fn do_upload(
+        &self,
+        workspace_id: &str,
+        tenant_id: &str,
+        source_path: &str,
+        compress: bool,
+        ttl_seconds: u32,
+        label: &str,
+    ) -> std::result::Result<UploadResponse, Status> {
+        if workspace_id.is_empty() {
+            return Err(Status::invalid_argument("workspace_id is required"));
+        }
+        let source = self.workspaces.resolve_path(workspace_id, source_path)?;
+
+        let meta = fs::metadata(&source).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Status::not_found(format!("no such path: {source_path}"))
+            } else {
+                Status::from(Error::Io(e))
+            }
+        })?;
+
+        // Directories always tar.gz; files gz if `compress`, raw otherwise.
+        // The cleanup guard keeps the temp tarball around for the upload's
+        // lifetime and removes it when we drop back out of this scope.
+        let is_dir = meta.is_dir();
+        let (payload_path, effective_basename, content_type, _cleanup) = if is_dir || compress {
+            let basename = source.file_name().map_or_else(
+                || "workspace".to_string(),
+                |s| s.to_string_lossy().into_owned(),
+            );
+            let out_basename = format!("{basename}.tar.gz");
+            let tmp = tar_gz_into_temp(&source, &out_basename).await?;
+            (
+                tmp.clone(),
+                out_basename,
+                "application/gzip",
+                Some(TempFileGuard(tmp)),
+            )
+        } else {
+            let basename = source.file_name().map_or_else(
+                || "artifact".to_string(),
+                |s| s.to_string_lossy().into_owned(),
+            );
+            let ct = guess_content_type(&source);
+            (source.clone(), basename, ct, None)
+        };
+
+        let key = self
+            .oss
+            .build_key(tenant_id, workspace_id, &effective_basename);
+        let opt_label = if label.is_empty() { None } else { Some(label) };
+        let outcome = self
+            .oss
+            .upload_file(&key, &payload_path, content_type, opt_label)
+            .await?;
+
+        let ttl = if ttl_seconds == 0 {
+            self.oss.default_expires()
+        } else {
+            Duration::from_secs(u64::from(ttl_seconds)).min(self.oss.max_expires())
+        };
+        let url = self.oss.signed_url(&outcome.key, ttl).await?;
+
+        Ok(UploadResponse {
+            url,
+            object_key: outcome.key,
+            size_bytes: outcome.size_bytes,
+            content_type: outcome.content_type,
+            sha256_hex: outcome.sha256_hex,
+        })
+    }
 }
 
 /// Holds a semaphore permit for the lifetime of an exec call. Dropped at
@@ -159,17 +287,8 @@ impl Sandbox for SandboxService {
         &self,
         req: Request<ExecRequest>,
     ) -> std::result::Result<Response<ExecResponse>, Status> {
-        let permit = self.acquire_exec_permit().await?;
-        let params = self.build_exec_params(req.into_inner()).await?;
-        let outcome = self.runtime.exec_oneshot(params).await?;
-        drop(permit);
-        Ok(Response::new(ExecResponse {
-            exit_code: outcome.exit_code,
-            stdout: outcome.stdout,
-            stderr: outcome.stderr,
-            duration_ms: outcome.duration_ms,
-            timed_out: outcome.timed_out,
-        }))
+        let resp = self.do_exec_oneshot(req.into_inner()).await?;
+        Ok(Response::new(resp))
     }
 
     type ExecStreamStream = ExecStreamOut;
@@ -222,40 +341,16 @@ impl Sandbox for SandboxService {
         req: Request<FetchRequest>,
     ) -> std::result::Result<Response<FetchResponse>, Status> {
         let inner = req.into_inner();
-        let sandbox = self.runtime.sandbox_cfg();
-        self.workspaces
-            .ensure_home(&inner.workspace_id, sandbox.agent_uid, sandbox.agent_gid)
+        let resp = self
+            .do_fetch(
+                &inner.workspace_id,
+                &inner.url,
+                &inner.target_path,
+                &inner.headers,
+                inner.timeout_seconds,
+            )
             .await?;
-        let target = self
-            .workspaces
-            .resolve_path(&inner.workspace_id, &inner.target_path)?;
-
-        let timeout = if inner.timeout_seconds == 0 {
-            Duration::from_secs(self.fetch_cfg.timeout_seconds)
-        } else {
-            Duration::from_secs(u64::from(inner.timeout_seconds))
-        };
-
-        let outcome = fetch_to_file(
-            &self.fetch_cfg,
-            &inner.url,
-            &target,
-            &inner.headers,
-            timeout,
-        )
-        .await?;
-
-        // Make the downloaded file world-readable (the container UID needs
-        // `o+r` since we can't chown on non-root hosts).
-        fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
-            .await
-            .map_err(Error::from)?;
-
-        Ok(Response::new(FetchResponse {
-            bytes_written: outcome.bytes_written,
-            content_type: outcome.content_type,
-            http_status: i32::from(outcome.http_status),
-        }))
+        Ok(Response::new(resp))
     }
 
     async fn upload_to_oss(
@@ -263,75 +358,17 @@ impl Sandbox for SandboxService {
         req: Request<UploadRequest>,
     ) -> std::result::Result<Response<UploadResponse>, Status> {
         let inner = req.into_inner();
-        if inner.workspace_id.is_empty() {
-            return Err(Status::invalid_argument("workspace_id is required"));
-        }
-        let source = self
-            .workspaces
-            .resolve_path(&inner.workspace_id, &inner.source_path)?;
-
-        let meta = fs::metadata(&source).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                Status::not_found(format!("no such path: {}", inner.source_path))
-            } else {
-                Status::from(Error::Io(e))
-            }
-        })?;
-
-        // Determine upload payload — a temp tar.gz for directories or
-        // compressed files, or the file itself otherwise. Paired with a
-        // `_cleanup` guard so the temp is deleted post-upload.
-        let is_dir = meta.is_dir();
-        let (payload_path, effective_basename, content_type, _cleanup) = if is_dir || inner.compress
-        {
-            let basename = source.file_name().map_or_else(
-                || "workspace".to_string(),
-                |s| s.to_string_lossy().into_owned(),
-            );
-            let out_basename = format!("{basename}.tar.gz");
-            let tmp = tar_gz_into_temp(&source, &out_basename).await?;
-            (
-                tmp.clone(),
-                out_basename,
-                "application/gzip",
-                Some(TempFileGuard(tmp)),
+        let resp = self
+            .do_upload(
+                &inner.workspace_id,
+                &inner.tenant_id,
+                &inner.source_path,
+                inner.compress,
+                inner.ttl_seconds,
+                &inner.label,
             )
-        } else {
-            let basename = source.file_name().map_or_else(
-                || "artifact".to_string(),
-                |s| s.to_string_lossy().into_owned(),
-            );
-            let ct = guess_content_type(&source);
-            (source.clone(), basename, ct, None)
-        };
-
-        let key = self
-            .oss
-            .build_key(&inner.tenant_id, &inner.workspace_id, &effective_basename);
-        let label = if inner.label.is_empty() {
-            None
-        } else {
-            Some(inner.label.as_str())
-        };
-        let outcome = self
-            .oss
-            .upload_file(&key, &payload_path, content_type, label)
             .await?;
-
-        let ttl = if inner.ttl_seconds == 0 {
-            self.oss.default_expires()
-        } else {
-            Duration::from_secs(u64::from(inner.ttl_seconds)).min(self.oss.max_expires())
-        };
-        let url = self.oss.signed_url(&outcome.key, ttl).await?;
-
-        Ok(Response::new(UploadResponse {
-            url,
-            object_key: outcome.key,
-            size_bytes: outcome.size_bytes,
-            content_type: outcome.content_type,
-            sha256_hex: outcome.sha256_hex,
-        }))
+        Ok(Response::new(resp))
     }
 
     async fn list_files(
@@ -343,8 +380,6 @@ impl Sandbox for SandboxService {
             .workspaces
             .resolve_path(&inner.workspace_id, &inner.path)?;
 
-        // If base is missing, return empty rather than NotFound — an empty
-        // workspace is a valid state.
         match fs::metadata(&base).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -388,15 +423,116 @@ impl Sandbox for SandboxService {
         &self,
         _req: Request<ListToolsRequest>,
     ) -> std::result::Result<Response<ListToolsResponse>, Status> {
-        Err(Status::unimplemented("list_tools: pending implementation"))
+        Ok(Response::new(ListToolsResponse {
+            tools: tools::descriptors(),
+        }))
     }
 
     async fn call_tool(
         &self,
-        _req: Request<CallToolRequest>,
+        req: Request<CallToolRequest>,
     ) -> std::result::Result<Response<CallToolResponse>, Status> {
-        Err(Status::unimplemented("call_tool: pending implementation"))
+        let inner = req.into_inner();
+        let args_json = if inner.arguments_json.trim().is_empty() {
+            "{}"
+        } else {
+            inner.arguments_json.as_str()
+        };
+
+        let result_json = match inner.tool_name.as_str() {
+            tools::TOOL_EXECUTE_SHELL => {
+                let args: tools::ExecuteShellArgs = serde_json::from_str(args_json)
+                    .map_err(|e| Status::invalid_argument(format!("execute_shell args: {e}")))?;
+                let timeout_seconds = if inner.timeout_seconds > 0 {
+                    inner.timeout_seconds
+                } else {
+                    args.timeout_seconds
+                };
+                let exec_req = ExecRequest {
+                    workspace_id: inner.workspace_id.clone(),
+                    tenant_id: inner.tenant_id.clone(),
+                    command: args.command,
+                    timeout_seconds,
+                    env: args.env,
+                    image: String::new(),
+                    limits: None,
+                };
+                let resp = self.do_exec_oneshot(exec_req).await?;
+                let result = tools::ExecuteShellResult {
+                    exit_code: resp.exit_code,
+                    stdout: String::from_utf8_lossy(&resp.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&resp.stderr).into_owned(),
+                    duration_ms: resp.duration_ms,
+                    timed_out: resp.timed_out,
+                };
+                encode_result(&result)?
+            }
+            tools::TOOL_FETCH => {
+                let args: tools::FetchArgs = serde_json::from_str(args_json)
+                    .map_err(|e| Status::invalid_argument(format!("fetch args: {e}")))?;
+                let timeout_seconds = if inner.timeout_seconds > 0 {
+                    inner.timeout_seconds
+                } else {
+                    args.timeout_seconds
+                };
+                let resp = self
+                    .do_fetch(
+                        &inner.workspace_id,
+                        &args.url,
+                        &args.target_path,
+                        &args.headers,
+                        timeout_seconds,
+                    )
+                    .await?;
+                let result = tools::FetchResult {
+                    target_path: args.target_path,
+                    bytes_written: resp.bytes_written,
+                    content_type: resp.content_type,
+                    http_status: resp.http_status,
+                };
+                encode_result(&result)?
+            }
+            tools::TOOL_DELIVER => {
+                let args: tools::DeliverArgs = serde_json::from_str(args_json)
+                    .map_err(|e| Status::invalid_argument(format!("deliver args: {e}")))?;
+                let resp = self
+                    .do_upload(
+                        &inner.workspace_id,
+                        &inner.tenant_id,
+                        &args.path,
+                        args.compress,
+                        args.ttl_seconds,
+                        &args.label,
+                    )
+                    .await?;
+                let result = tools::DeliverResult {
+                    url: resp.url,
+                    object_key: resp.object_key,
+                    size_bytes: resp.size_bytes,
+                    content_type: resp.content_type,
+                    sha256_hex: resp.sha256_hex,
+                };
+                encode_result(&result)?
+            }
+            other => {
+                return Ok(Response::new(CallToolResponse {
+                    result_json: String::new(),
+                    is_error: true,
+                    error_message: format!("unknown tool: {other}"),
+                }));
+            }
+        };
+
+        Ok(Response::new(CallToolResponse {
+            result_json,
+            is_error: false,
+            error_message: String::new(),
+        }))
     }
+}
+
+fn encode_result<T: serde::Serialize>(v: &T) -> std::result::Result<String, Status> {
+    serde_json::to_string(v).map_err(|e| Status::internal(format!("encode result: {e}")))
 }
 
 /// RAII guard that deletes a temporary file when dropped. Used to clean up
@@ -405,7 +541,6 @@ struct TempFileGuard(PathBuf);
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
-        // Best-effort cleanup; ignore errors.
         let _ = std::fs::remove_file(&self.0);
     }
 }

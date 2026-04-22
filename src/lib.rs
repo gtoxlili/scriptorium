@@ -4,6 +4,7 @@ pub mod fetch;
 pub mod oss;
 pub mod runtime;
 pub mod service;
+pub mod tools;
 pub mod workspace;
 
 // Tonic-generated code does not follow our lint policy. Scope the allows

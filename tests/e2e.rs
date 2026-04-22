@@ -22,8 +22,8 @@ use scriptorium::{
     },
     oss::OssClient,
     pb::{
-        DeleteWorkspaceRequest, ExecRequest, HealthRequest, ListFilesRequest, exec_event,
-        sandbox_client::SandboxClient, sandbox_server::SandboxServer,
+        CallToolRequest, DeleteWorkspaceRequest, ExecRequest, HealthRequest, ListFilesRequest,
+        ListToolsRequest, exec_event, sandbox_client::SandboxClient, sandbox_server::SandboxServer,
     },
     runtime::DockerRuntime,
     service::SandboxService,
@@ -381,6 +381,97 @@ async fn delete_workspace_removes_host_directory() {
         .unwrap()
         .into_inner();
     assert!(!resp.existed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires local docker + scriptorium-sandbox image"]
+async fn list_tools_advertises_three_tools() {
+    let (addr, _tmp) = spawn_service().await;
+    let mut client = client(addr).await;
+    let resp = client
+        .list_tools(ListToolsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let names: Vec<String> = resp.tools.iter().map(|t| t.name.clone()).collect();
+    assert_eq!(names.len(), 3, "expected 3 tools, got {names:?}");
+    assert!(names.contains(&"execute_shell".to_string()));
+    assert!(names.contains(&"fetch".to_string()));
+    assert!(names.contains(&"deliver".to_string()));
+    // Every schema must be valid JSON.
+    for t in &resp.tools {
+        serde_json::from_str::<serde_json::Value>(&t.parameters_schema)
+            .unwrap_or_else(|e| panic!("tool {} schema invalid: {e}", t.name));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires local docker + scriptorium-sandbox image"]
+async fn call_tool_execute_shell_routes_to_exec() {
+    let (addr, _tmp) = spawn_service().await;
+    let mut client = client(addr).await;
+    let args = serde_json::json!({
+        "command": "echo ok-from-tool",
+    });
+    let resp = client
+        .call_tool(CallToolRequest {
+            workspace_id: "tool-exec".into(),
+            tenant_id: "t".into(),
+            tool_name: "execute_shell".into(),
+            arguments_json: args.to_string(),
+            timeout_seconds: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!resp.is_error, "got error: {}", resp.error_message);
+    let parsed: serde_json::Value = serde_json::from_str(&resp.result_json).unwrap();
+    assert_eq!(parsed["exit_code"], 0);
+    assert_eq!(parsed["stdout"], "ok-from-tool\n");
+    assert_eq!(parsed["timed_out"], false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires local docker + scriptorium-sandbox image"]
+async fn call_tool_rejects_unknown_tool() {
+    let (addr, _tmp) = spawn_service().await;
+    let mut client = client(addr).await;
+    let resp = client
+        .call_tool(CallToolRequest {
+            workspace_id: "tool-unknown".into(),
+            tenant_id: "t".into(),
+            tool_name: "does_not_exist".into(),
+            arguments_json: "{}".into(),
+            timeout_seconds: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.is_error);
+    assert!(resp.error_message.contains("unknown tool"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires local docker + scriptorium-sandbox image"]
+async fn fetch_rejects_private_address() {
+    let (addr, _tmp) = spawn_service().await;
+    let mut client = client(addr).await;
+    let err = client
+        .fetch_into_workspace(scriptorium::pb::FetchRequest {
+            workspace_id: "ssrf".into(),
+            tenant_id: "t".into(),
+            url: "http://127.0.0.1:1/".into(),
+            target_path: "evil".into(),
+            headers: std::collections::HashMap::new(),
+            timeout_seconds: 5,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.message().contains("disallowed"),
+        "unexpected error: {}",
+        err.message()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
