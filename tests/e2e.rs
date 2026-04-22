@@ -416,8 +416,9 @@ async fn upload_to_oss_roundtrips_through_signed_url() {
         .exec(ExecRequest {
             workspace_id: ws.into(),
             tenant_id: "e2e-tenant".into(),
-            command: "printf 'hello from scriptorium e2e\\n' > ~/artifact.txt && ls -la ~/artifact.txt"
-                .to_string(),
+            command:
+                "printf 'hello from scriptorium e2e\\n' > ~/artifact.txt && ls -la ~/artifact.txt"
+                    .to_string(),
             ..Default::default()
         })
         .await
