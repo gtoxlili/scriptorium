@@ -1,5 +1,7 @@
 pub mod config;
 pub mod error;
+pub mod fetch;
+pub mod oss;
 pub mod runtime;
 pub mod service;
 pub mod workspace;

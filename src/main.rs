@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 use scriptorium::{
-    config::Config, pb::sandbox_server::SandboxServer, runtime::DockerRuntime,
+    config::Config, oss::OssClient, pb::sandbox_server::SandboxServer, runtime::DockerRuntime,
     service::SandboxService, workspace::WorkspaceManager,
 };
 use tonic::transport::Server;
@@ -35,8 +35,15 @@ async fn main() -> anyhow::Result<()> {
     workspaces.ensure_root().await?;
 
     let runtime = DockerRuntime::connect(cfg.docker.clone(), cfg.sandbox.clone()).await?;
+    let oss = OssClient::connect(&cfg.tos)?;
 
-    let svc = SandboxService::new(runtime, workspaces, &cfg.concurrency);
+    let svc = SandboxService::new(
+        runtime,
+        workspaces,
+        oss,
+        cfg.fetch.clone(),
+        &cfg.concurrency,
+    );
 
     let addr = cfg.server.listen;
     tracing::info!(%addr, "gRPC server listening");

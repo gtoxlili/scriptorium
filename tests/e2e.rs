@@ -17,7 +17,10 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use scriptorium::{
-    config::{ConcurrencyConfig, DockerConfig, SandboxConfig, WorkspaceConfig},
+    config::{
+        ConcurrencyConfig, DockerConfig, FetchConfig, SandboxConfig, TosConfig, WorkspaceConfig,
+    },
+    oss::OssClient,
     pb::{
         DeleteWorkspaceRequest, ExecRequest, HealthRequest, ListFilesRequest, exec_event,
         sandbox_client::SandboxClient, sandbox_server::SandboxServer,
@@ -63,6 +66,28 @@ fn concurrency_cfg_for_tests() -> ConcurrencyConfig {
     }
 }
 
+/// Placeholder TOS config — non-OSS tests never hit it, so dummy creds are
+/// fine. Tests that do exercise `upload_to_oss` override fields from env.
+fn tos_cfg_for_tests() -> TosConfig {
+    TosConfig {
+        endpoint: std::env::var("SCRIPTORIUM_TEST_TOS_ENDPOINT")
+            .unwrap_or_else(|_| "https://tos-s3-cn-shanghai.volces.com".to_string()),
+        region: std::env::var("SCRIPTORIUM_TEST_TOS_REGION")
+            .unwrap_or_else(|_| "cn-shanghai".to_string()),
+        bucket: std::env::var("SCRIPTORIUM_TEST_TOS_BUCKET")
+            .unwrap_or_else(|_| "dummy-bucket".to_string()),
+        access_key: std::env::var("SCRIPTORIUM_TEST_TOS_ACCESS_KEY")
+            .unwrap_or_else(|_| "dummy-access-key".to_string()),
+        secret_key: std::env::var("SCRIPTORIUM_TEST_TOS_SECRET_KEY")
+            .unwrap_or_else(|_| "dummy-secret-key".to_string()),
+        key_prefix: "scriptorium-test/".to_string(),
+        signed_url_expires_seconds: 600,
+        signed_url_max_seconds: 3600,
+        part_size_bytes: 8 * 1024 * 1024,
+        upload_timeout_seconds: 120,
+    }
+}
+
 /// Boot an in-process SandboxService listening on a random port. Returns
 /// (`bound_addr`, `tmp_root`); dropping `tmp_root` wipes the workspace state.
 async fn spawn_service() -> (SocketAddr, TempDir) {
@@ -81,7 +106,14 @@ async fn spawn_service() -> (SocketAddr, TempDir) {
         .expect("docker connect");
     let workspaces = WorkspaceManager::new(workspace_cfg);
     workspaces.ensure_root().await.expect("ensure_root");
-    let svc = SandboxService::new(runtime, workspaces, &concurrency_cfg_for_tests());
+    let oss = OssClient::connect(&tos_cfg_for_tests()).expect("oss connect");
+    let svc = SandboxService::new(
+        runtime,
+        workspaces,
+        oss,
+        FetchConfig::default(),
+        &concurrency_cfg_for_tests(),
+    );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
