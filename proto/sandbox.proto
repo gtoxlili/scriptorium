@@ -133,19 +133,24 @@ message UploadRequest {
   // are uploaded as-is unless `compress = true`.
   string source_path = 3;
   bool compress = 4;
-  // Signed URL TTL in seconds. 0 = server default. Clamped server-side.
-  uint32 ttl_seconds = 5;
   // Optional human-readable label stored as object metadata.
   string label = 6;
+  reserved 5;  // previously `ttl_seconds` for signed-URL TTL
 }
 message UploadResponse {
-  // Signed download URL. Expires after `ttl_seconds`.
-  string url = 1;
-  // Full object key for audit (bucket-relative).
+  // Full bucket-relative object key. This is the *permanent* handle the
+  // caller must persist. Callers resolve it to a user-facing URL via
+  // their own attachment system — scriptorium deliberately does not
+  // return a signed URL because a TTL-bound link is a footgun for
+  // artifacts the user expects to revisit days later.
   string object_key = 2;
   uint64 size_bytes = 3;
   string content_type = 4;
   string sha256_hex = 5;
+  // Basename of the uploaded artifact (post-packaging) — handy when the
+  // caller is registering this as an attachment row.
+  string basename = 6;
+  reserved 1;  // previously `url` for signed download URL
 }
 
 message ListFilesRequest {

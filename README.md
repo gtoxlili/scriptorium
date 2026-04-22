@@ -37,8 +37,10 @@ the same way an application server orchestrates request handlers.
       │                                   │  streamed to disk.       │                   │
       │                                   │                                              │
       │  UploadToOSS(path, compress?) ───▶│  tar.gz if dir,  ──────────────────────────▶ │
-      │  ◀──── signed download URL ───    │  aws-sdk-s3 PUT + presign.                   │
+      │  ◀──── object_key + metadata ──   │  aws-sdk-s3 PUT.                             │
       │                                   │                                              │
+      │  (caller resolves object_key to a permanent URL via its own                      │
+      │   attachment system — scriptorium does not presign.)                             │
 
   ListTools / CallTool: LLM-shaped convenience wrappers over the three
   primitives above — same semantics, OpenAI function-call descriptors.
@@ -50,8 +52,12 @@ persistent** (installed pip packages, Chromium profile, produced artifacts).
 session, task, whatever.
 
 Data never flows through gRPC as raw bytes: inputs come in via HTTP URLs
-(`FetchIntoWorkspace`), outputs go out as signed object-storage URLs
-(`UploadToOSS`). The caller is never a middleman for artifact bytes.
+(`FetchIntoWorkspace`), outputs land in object storage and come back as
+a **permanent `object_key`** — the caller resolves that key to a
+user-facing URL through its own attachment system. Scriptorium does not
+return TTL-limited presigned URLs because artifacts the user wants to
+revisit days later would 403; the caller (agent-core) issues stable
+`/api/v1/public/attachments/{id}` handles that re-sign on each access.
 
 Full design rationale: [`docs/architecture.md`](docs/architecture.md).
 
@@ -64,10 +70,12 @@ Full design rationale: [`docs/architecture.md`](docs/architecture.md).
 - **Hard resource caps** per exec: CPU millis, memory bytes, PID limit, wall
   clock. Admission is throttled by a configurable concurrency semaphore
   (default 4); queued requests return `RESOURCE_EXHAUSTED` after the timeout.
-- **URL-in / OSS-out file handling** — `FetchIntoWorkspace` with SSRF
-  defence against loopback / RFC1918 / link-local / ULA, and
-  `UploadToOSS` producing signed download URLs via any S3-compatible
-  object store (defaults aligned with Volcano Engine TOS).
+- **URL-in / object-key-out file handling** — `FetchIntoWorkspace` with
+  SSRF defence against loopback / RFC1918 / link-local / ULA, and
+  `UploadToOSS` uploading to any S3-compatible object store (defaults
+  aligned with Volcano Engine TOS) and returning the permanent
+  `object_key`. Callers mint user-facing URLs from that key through
+  their own attachment system.
 - **AI-facing tool layer** — `ListTools` publishes three OpenAI-compatible
   descriptors (`execute_shell`, `fetch`, `deliver`); `CallTool` dispatches
   to the primitives using the same implementation path.

@@ -204,7 +204,6 @@ impl SandboxService {
         tenant_id: &str,
         source_path: &str,
         compress: bool,
-        ttl_seconds: u32,
         label: &str,
     ) -> std::result::Result<UploadResponse, Status> {
         if workspace_id.is_empty() {
@@ -255,19 +254,12 @@ impl SandboxService {
             .upload_file(&key, &payload_path, content_type, opt_label)
             .await?;
 
-        let ttl = if ttl_seconds == 0 {
-            self.oss.default_expires()
-        } else {
-            Duration::from_secs(u64::from(ttl_seconds)).min(self.oss.max_expires())
-        };
-        let url = self.oss.signed_url(&outcome.key, ttl).await?;
-
         Ok(UploadResponse {
-            url,
             object_key: outcome.key,
             size_bytes: outcome.size_bytes,
             content_type: outcome.content_type,
             sha256_hex: outcome.sha256_hex,
+            basename: effective_basename,
         })
     }
 }
@@ -364,7 +356,6 @@ impl Sandbox for SandboxService {
                 &inner.tenant_id,
                 &inner.source_path,
                 inner.compress,
-                inner.ttl_seconds,
                 &inner.label,
             )
             .await?;
@@ -501,13 +492,12 @@ impl Sandbox for SandboxService {
                         &inner.tenant_id,
                         &args.path,
                         args.compress,
-                        args.ttl_seconds,
                         &args.label,
                     )
                     .await?;
                 let result = tools::DeliverResult {
-                    url: resp.url,
                     object_key: resp.object_key,
+                    basename: resp.basename,
                     size_bytes: resp.size_bytes,
                     content_type: resp.content_type,
                     sha256_hex: resp.sha256_hex,

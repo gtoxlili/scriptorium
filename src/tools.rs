@@ -37,9 +37,11 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: TOOL_DELIVER.to_string(),
-            description: "Upload a workspace file or directory to object storage and \
-                return a signed download URL you can hand to the end user. \
-                Directories are tar.gz'd automatically."
+            description: "Upload a workspace file or directory to object storage. \
+                Returns the object_key (plus size / content-type / sha256) — \
+                the caller's host system turns that into a user-facing URL \
+                via its own attachment mechanism. Directories are tar.gz'd \
+                automatically."
                 .to_string(),
             parameters_schema: DELIVER_SCHEMA.to_string(),
         },
@@ -73,8 +75,6 @@ pub struct DeliverArgs {
     #[serde(default)]
     pub compress: bool,
     #[serde(default)]
-    pub ttl_seconds: u32,
-    #[serde(default)]
     pub label: String,
 }
 
@@ -99,8 +99,8 @@ pub struct FetchResult {
 
 #[derive(Debug, Serialize)]
 pub struct DeliverResult {
-    pub url: String,
     pub object_key: String,
+    pub basename: String,
     pub size_bytes: u64,
     pub content_type: String,
     pub sha256_hex: String,
@@ -165,11 +165,6 @@ const DELIVER_SCHEMA: &str = r#"{
     "compress": {
       "type": "boolean",
       "description": "When true, single files are gzipped. Directories are always tar.gz'd."
-    },
-    "ttl_seconds": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "Signed URL lifetime. Clamped to the server max (default 24h)."
     },
     "label": {
       "type": "string",

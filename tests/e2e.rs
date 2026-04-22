@@ -416,9 +416,8 @@ async fn upload_to_oss_roundtrips_through_signed_url() {
         .exec(ExecRequest {
             workspace_id: ws.into(),
             tenant_id: "e2e-tenant".into(),
-            command: format!(
-                "printf 'hello from scriptorium e2e\\n' > ~/artifact.txt && ls -la ~/artifact.txt"
-            ),
+            command: "printf 'hello from scriptorium e2e\\n' > ~/artifact.txt && ls -la ~/artifact.txt"
+                .to_string(),
             ..Default::default()
         })
         .await
@@ -426,14 +425,14 @@ async fn upload_to_oss_roundtrips_through_signed_url() {
         .into_inner();
     assert_eq!(exec_resp.exit_code, 0, "produce artifact failed");
 
-    // 2. Deliver.
+    // 2. Deliver (scriptorium's job). Response contains only the permanent
+    //    object_key + metadata — no TTL URL.
     let resp = client
         .upload_to_oss(scriptorium::pb::UploadRequest {
             workspace_id: ws.into(),
             tenant_id: "e2e-tenant".into(),
             source_path: "artifact.txt".into(),
             compress: false,
-            ttl_seconds: 120,
             label: "e2e-test".into(),
         })
         .await
@@ -444,16 +443,22 @@ async fn upload_to_oss_roundtrips_through_signed_url() {
     assert!(resp.object_key.contains(ws));
     assert_eq!(resp.content_type, "text/plain; charset=utf-8");
     assert!(!resp.sha256_hex.is_empty());
-    assert!(!resp.url.is_empty());
+    assert_eq!(resp.basename, "artifact.txt");
 
     println!("object_key: {}", resp.object_key);
+    println!("basename:   {}", resp.basename);
     println!("sha256:     {}", resp.sha256_hex);
-    println!("url:        {}", resp.url);
 
-    // 3. Fetch via the signed URL and confirm private-read semantics hold.
-    let http_client = reqwest::Client::new();
-    let body = http_client
-        .get(&resp.url)
+    // 3. To simulate what agent-core does at download time — re-sign with
+    //    the configured OSS client and fetch. Proves the object landed
+    //    correctly and is retrievable from a private-read bucket.
+    let oss = OssClient::connect(&tos_cfg_for_tests()).expect("oss connect for signing");
+    let signed_url = oss
+        .signed_url(&resp.object_key, std::time::Duration::from_secs(120))
+        .await
+        .expect("signed url");
+    let body = reqwest::Client::new()
+        .get(&signed_url)
         .send()
         .await
         .expect("signed url fetch")

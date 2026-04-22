@@ -88,23 +88,39 @@ Mixing the two would let any script in the sandbox read any credential, and
 would couple credential lifetime to sandbox GC. We keep them separated as a
 hard boundary.
 
-### Data flow: URLs in, URLs out
+### Data flow: URLs in, object keys out
 
 Scriptorium deliberately does **not** shuttle file bytes through gRPC.
 Inputs land via `FetchIntoWorkspace(url, target_path)` — a host-side
 reqwest that streams the body into the workspace under an SSRF guard.
 Outputs leave via `UploadToOSS(source_path, compress?)` — the service
 tars + gzips directories as needed, uploads to an S3-compatible object
-store (Volcano Engine TOS by default), and returns a signed download URL
-you can hand straight to the end user.
+store (Volcano Engine TOS by default), and returns the **permanent
+`object_key`** (plus size / content-type / sha256 / basename) — but
+**no signed URL**.
+
+The signed-URL concern belongs to the caller, not to scriptorium.
+Presigned URLs are TTL-limited by design, and artifacts the user wants
+to revisit days later would 403. The caller's host system (agent-core,
+specifically) owns an attachment table keyed by UUID and issues a
+stable, permanent URL of the shape
+`https://{base}/api/v1/public/attachments/{id}?access_key={secret}`.
+That endpoint re-signs a fresh short-TTL presigned URL on every hit, so
+the URL the end user bookmarks never expires.
+
+Scriptorium therefore does one job — put the bytes in the bucket and
+return the handle — and leaves delivery UX to the caller's existing
+machinery. Agent-core in particular has an attachment repository
+(`attachments` table, `RegisterExistingObject` entry point) that takes
+the object_key + metadata scriptorium returns and mints a permanent
+token.
 
 Consequences:
 
 - The caller never has to proxy artifact bytes; the agent service stays
   slim and stays out of I/O hot paths.
-- Sandbox inputs and outputs are always addressable by URL, which
-  composes naturally with chat UIs (the user-supplied file already has
-  a URL from the upload dialog; the delivery URL is the return value).
+- Signed-URL TTL is invisible to the end user — the attachment handle
+  outlives any particular presign.
 - Credentials for third-party services live in the caller's secure
   store; they're injected into a single `Exec` call via `env` or via a
   short-lived `FetchIntoWorkspace` of a credential file.
