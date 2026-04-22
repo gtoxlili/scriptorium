@@ -47,8 +47,13 @@ mount:  /home/agent                    (inside the container)
 ```
 
 The in-container user is a fixed UID/GID (default `1000:1000`). The host
-directory is chowned to that pair on first access so bind-mount writes land
-with the correct ownership.
+directory is chowned to that pair on first access so bind-mount writes
+land with the correct ownership. When the chown is refused with `EPERM`
+(e.g. macOS dev setups where the service runs as a regular user), the
+manager falls back to `chmod 0777` on that single per-workspace directory
+so the container user can still write. Production Linux deployments
+should run the service as root — or with `CAP_CHOWN` — to prefer the
+tighter chown path.
 
 ### workspace_id is opaque
 
@@ -76,12 +81,33 @@ does not participate in directory keying.
 - **Business credentials** (NOT this service): platform login cookies,
   API tokens, user assets. Callers must keep those in their own encrypted
   store and inject them into individual `Exec` calls via the `env` field
-  or by `PutFile`-ing a short-lived credential file before the exec.
-  Scriptorium never stores long-lived secrets.
+  or by `FetchIntoWorkspace`-ing a short-lived credential file before the
+  exec. Scriptorium never stores long-lived secrets.
 
 Mixing the two would let any script in the sandbox read any credential, and
 would couple credential lifetime to sandbox GC. We keep them separated as a
 hard boundary.
+
+### Data flow: URLs in, URLs out
+
+Scriptorium deliberately does **not** shuttle file bytes through gRPC.
+Inputs land via `FetchIntoWorkspace(url, target_path)` — a host-side
+reqwest that streams the body into the workspace under an SSRF guard.
+Outputs leave via `UploadToOSS(source_path, compress?)` — the service
+tars + gzips directories as needed, uploads to an S3-compatible object
+store (Volcano Engine TOS by default), and returns a signed download URL
+you can hand straight to the end user.
+
+Consequences:
+
+- The caller never has to proxy artifact bytes; the agent service stays
+  slim and stays out of I/O hot paths.
+- Sandbox inputs and outputs are always addressable by URL, which
+  composes naturally with chat UIs (the user-supplied file already has
+  a URL from the upload dialog; the delivery URL is the return value).
+- Credentials for third-party services live in the caller's secure
+  store; they're injected into a single `Exec` call via `env` or via a
+  short-lived `FetchIntoWorkspace` of a credential file.
 
 ## Isolation model
 
@@ -113,10 +139,34 @@ MVP: the container has default bridge networking and unrestricted egress.
 This is deliberate — the primary workloads (scraping, RPA, media
 processing, API calls) all need outbound network.
 
+`FetchIntoWorkspace` on the host side *is* SSRF-guarded: the resolved
+IP must not fall into loopback, RFC1918, link-local, broadcast,
+documentation, CGNAT (100.64/10), or IPv6 loopback / ULA / link-local
+ranges. `fetch.allow_private_network` in the config lifts the guard if
+the deployment genuinely needs to pull from internal hosts.
+
 A follow-up hardening phase will:
-1. Front all egress with a service-managed mitmproxy, logging host+path
-   per request for audit.
+1. Front all container egress with a service-managed mitmproxy, logging
+   host+path per request for audit.
 2. Optionally enforce per-tenant egress allowlists.
+
+### Admission control: concurrency semaphore
+
+Every `Exec` / `ExecStream` acquires a permit from a tokio semaphore
+whose capacity is `concurrency.max_concurrent_execs` (default 4). When
+the pool is saturated, requests queue for up to
+`concurrency.exec_queue_timeout_seconds` (default 30 s) and then return
+`RESOURCE_EXHAUSTED` with a retry hint. This prevents an N-user burst
+from all simultaneously reserving their per-container 8 GiB memory cap
+and triggering an OOM on the host.
+
+`FetchIntoWorkspace`, `UploadToOSS`, `ListFiles`, and `DeleteWorkspace`
+do **not** consume permits — they are host-side I/O with no container
+cost. `CallTool` routes through the same `do_exec_oneshot` / `do_fetch`
+/ `do_upload` helpers as the primitives, so the semaphore gates
+`execute_shell` consistently whichever surface the caller uses.
+
+`Health` reports `exec_permits_available` for observability.
 
 ## Image design choices
 
@@ -131,6 +181,20 @@ A follow-up hardening phase will:
 - **No apt-installed Chromium.** Having both the Debian chromium package
   and Playwright's bundled browser causes version drift; the Playwright one
   is the only truth.
+
+## Two public surfaces, one implementation
+
+Primitive RPCs (`Exec`, `ExecStream`, `FetchIntoWorkspace`,
+`UploadToOSS`, `ListFiles`, `DeleteWorkspace`, `Health`) are the
+protocol-level truth. A second, AI-facing tool layer (`ListTools`,
+`CallTool`) sits in front of them: it publishes OpenAI-function-call /
+MCP-shaped descriptors for three tools — `execute_shell`, `fetch`,
+`deliver` — and routes invocations through the same `do_*` helpers that
+back the primitive handlers. There is no independent code path.
+
+The split exists because engine callers want the streaming-capable
+primitives directly, while LLM callers benefit from a thinner catalog
+with JSON Schema metadata. Either surface works — they cannot drift.
 
 ## Why Rust + tonic + bollard
 
@@ -160,4 +224,12 @@ A follow-up hardening phase will:
    Decision deferred until we measure actual spawn latency on OrbStack.
 2. **GC policy**: automatic pruning of old workspaces. MVP exposes manual
    `DeleteWorkspace`; a scheduled sweeper is Phase 2.
-3. **mitmproxy integration**: Phase 3.
+3. **Multipart upload for >1 GiB artifacts**: current `UploadToOSS`
+   reads the payload fully into memory before `put_object`. Move to the
+   aws-sdk-s3 transfer manager when an actual >1 GiB artifact shows up.
+4. **Cancellation on stream drop**: a dropped `ExecStream` client
+   currently leaves the container running to its natural end or wall
+   timeout. The container is still `AutoRemove=true` so it cleans up —
+   but the wasted work is visible. Wire a CancellationToken into the
+   stream future.
+5. **mitmproxy integration** for container-side egress audit: Phase 3.

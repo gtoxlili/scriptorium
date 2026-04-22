@@ -20,23 +20,38 @@ the same way an application server orchestrates request handlers.
 ## Design in one picture
 
 ```
- caller (agent)                         scriptorium                        OCI daemon
-────────────────                      ─────────────────                   ──────────────
-      │                                      │                                   │
-      │  gRPC: Exec(workspace_id, cmd) ───▶  │                                   │
-      │                                      │  bollard: run image,              │
-      │                                      │  bind-mount {root}/{id}/home,  ──▶│  ┌──────────────┐
-      │                                      │  drop to uid 1000,                │  │  container   │
-      │                                      │  enforce cpu/mem/pids,            │  │  (bash -lc)  │
-      │                                      │  wall-clock timeout.              │  └──────────────┘
-      │  ◀─── stdout / stderr / exit ────    │                                   │
-      │                                      │                                   │
+                                           ┌──────────────── URLs ────────────────┐
+                                           │                                      │
+ caller (agent)                     scriptorium                    Docker          OSS (S3-compat)
+────────────────                  ─────────────────              ──────────       ─────────────────
+      │                                   │                          │                   │
+      │  Exec(workspace_id, cmd)     ───▶ │  bollard: run image,     │                   │
+      │                                   │  bind-mount $HOME,       │                   │
+      │                                   │  drop to uid 1000,    ──▶│  ┌──────────────┐ │
+      │                                   │  cpu/mem/pids caps,      │  │  container   │ │
+      │                                   │  wall-clock timeout.     │  │  (bash -lc)  │ │
+      │  ◀── stdout / stderr / exit ──    │                          │  └──────────────┘ │
+      │                                   │                          │                   │
+      │  FetchIntoWorkspace(url, path) ──▶│  host-side reqwest,      │                   │
+      │                                   │  SSRF-guarded,        ──▶│  writes to $HOME  │
+      │                                   │  streamed to disk.       │                   │
+      │                                   │                                              │
+      │  UploadToOSS(path, compress?) ───▶│  tar.gz if dir,  ──────────────────────────▶ │
+      │  ◀──── signed download URL ───    │  aws-sdk-s3 PUT + presign.                   │
+      │                                   │                                              │
+
+  ListTools / CallTool: LLM-shaped convenience wrappers over the three
+  primitives above — same semantics, OpenAI function-call descriptors.
 ```
 
 Compute lifetime is **per-call ephemeral**. State lifetime is **per-workspace
 persistent** (installed pip packages, Chromium profile, produced artifacts).
 `workspace_id` is opaque to the service; the caller picks its granularity —
 session, task, whatever.
+
+Data never flows through gRPC as raw bytes: inputs come in via HTTP URLs
+(`FetchIntoWorkspace`), outputs go out as signed object-storage URLs
+(`UploadToOSS`). The caller is never a middleman for artifact bytes.
 
 Full design rationale: [`docs/architecture.md`](docs/architecture.md).
 
@@ -47,7 +62,15 @@ Full design rationale: [`docs/architecture.md`](docs/architecture.md).
 - **Per-workspace persistent state** mounted at a fixed in-container path.
 - **Fixed non-root user** (UID 1000) with read-only rootfs and sized tmpfs.
 - **Hard resource caps** per exec: CPU millis, memory bytes, PID limit, wall
-  clock.
+  clock. Admission is throttled by a configurable concurrency semaphore
+  (default 4); queued requests return `RESOURCE_EXHAUSTED` after the timeout.
+- **URL-in / OSS-out file handling** — `FetchIntoWorkspace` with SSRF
+  defence against loopback / RFC1918 / link-local / ULA, and
+  `UploadToOSS` producing signed download URLs via any S3-compatible
+  object store (defaults aligned with Volcano Engine TOS).
+- **AI-facing tool layer** — `ListTools` publishes three OpenAI-compatible
+  descriptors (`execute_shell`, `fetch`, `deliver`); `CallTool` dispatches
+  to the primitives using the same implementation path.
 - **Fat sandbox image** with Python, Node 20, Chromium/Playwright, FFmpeg,
   ImageMagick, and common CLIs pre-installed — no runtime `apt install` required.
 - **Workspace id validation** (`[A-Za-z0-9_-]{1,128}`) with host-side path
@@ -59,7 +82,8 @@ Full design rationale: [`docs/architecture.md`](docs/architecture.md).
 - Multi-host orchestration. Scriptorium is a single-node daemon; cluster it
   by placing instances behind a router.
 - Credential storage. Scriptorium does not remember secrets — callers inject
-  them per-exec via `env` or a short-lived `PutFile`.
+  them per-exec via `env` or by `FetchIntoWorkspace`-ing a short-lived
+  credential file before the exec.
 - Image building. Build the sandbox image out of band and reference it by tag.
 
 ## Repository layout
@@ -75,8 +99,11 @@ src/
   config.rs                 TOML config loader + validation
   error.rs                  Error types + tonic::Status mapping
   runtime.rs                Docker-backed container runtime (bollard)
-  service.rs                gRPC service implementation
+  service.rs                gRPC service impl + concurrency semaphore
   workspace.rs              Per-workspace state directory manager
+  fetch.rs                  URL-to-workspace download + SSRF guard
+  oss.rs                    S3-compatible upload + signed-URL presign
+  tools.rs                  AI-facing tool descriptors + arg/result types
 docker/sandbox.Dockerfile   The fat sandbox image
 deploy/config.example.toml  Example service configuration
 docs/architecture.md        Design decisions and boundaries
@@ -90,6 +117,9 @@ docs/architecture.md        Design decisions and boundaries
   `apt-get install -y protobuf-compiler`.
 - A Docker-compatible daemon reachable via Unix socket — OrbStack, Docker
   Desktop, Colima, or `dockerd` on Linux.
+- Credentials for an S3-compatible object store (Volcano Engine TOS, AWS
+  S3, Tencent COS, MinIO, Cloudflare R2, ...) configured under `[tos]` —
+  `UploadToOSS` signed URLs are how artifacts get delivered to end users.
 
 ## Build
 
@@ -129,13 +159,15 @@ protoc --go_out=. --go-grpc_out=. proto/sandbox.proto
 
 `tests/e2e.rs` covers every RPC end-to-end against a real Docker daemon:
 
-- `Health` reachability
+- `Health` — reachability and permit count reporting
 - `Exec` — stdout/stderr capture, non-zero exit propagation, wall-clock
   timeout, and persistent workspace state across calls
 - `ExecStream` — `Started`/chunk/`Finished` ordering
-- `PutFile` / `GetFile` — binary roundtrip with chunked streaming
+- `FetchIntoWorkspace` — SSRF guard rejects loopback targets
 - `ListFiles` — recursive walk reflects exec-produced contents
 - `DeleteWorkspace` — host directory removal + idempotent repeat
+- `ListTools` / `CallTool` — descriptor count, schema validity,
+  `execute_shell` routing, unknown-tool error shape
 - Invalid `workspace_id` → `InvalidArgument`
 
 These tests are `#[ignore]`-gated so CI (no Docker) is unaffected. To run
@@ -147,15 +179,19 @@ cargo test --test e2e -- --ignored --nocapture
 
 Override the image tag via `SCRIPTORIUM_TEST_IMAGE=...` or the docker
 socket via `DOCKER_HOST=unix:///path/to/docker.sock` if you are not on
-OrbStack's default path.
+OrbStack's default path. To also exercise `UploadToOSS` against a real
+bucket, set `SCRIPTORIUM_TEST_TOS_ENDPOINT` / `_REGION` / `_BUCKET` /
+`_ACCESS_KEY` / `_SECRET_KEY`.
 
 ## Status
 
-The scaffold and protocol are stable; `Exec`, `ExecStream`, and workspace
-file I/O are implemented and exercised by the e2e suite. Follow-up work
-documented in [`docs/architecture.md`](docs/architecture.md) includes the
-optional warm-pool, automatic workspace GC, and mitmproxy-fronted egress
-allowlists. Issues and PRs welcome.
+`Exec`, `ExecStream`, `FetchIntoWorkspace`, `UploadToOSS`, `ListFiles`,
+`DeleteWorkspace`, `ListTools`, `CallTool`, and `Health` are all
+implemented and covered by the e2e suite (13 cases, all green against
+OrbStack). Follow-up work documented in
+[`docs/architecture.md`](docs/architecture.md): optional warm-pool,
+automatic workspace GC, and mitmproxy-fronted egress allowlists.
+Issues and PRs welcome.
 
 ## License
 
