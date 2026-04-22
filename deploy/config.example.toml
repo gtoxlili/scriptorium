@@ -5,9 +5,16 @@
 listen = "127.0.0.1:50051"
 
 [docker]
-# OrbStack's Docker-compatible socket on macOS.
-# Docker Desktop uses /var/run/docker.sock; Colima typically uses ~/.colima/default/docker.sock.
-socket = "/Users/influo/.orbstack/run/docker.sock"
+# Path to the Docker daemon's Unix socket, as seen by the scriptorium
+# process itself (not necessarily the host).
+#
+#   Native run (launchd / cargo run) on macOS with OrbStack:
+#       socket = "/Users/influo/.orbstack/run/docker.sock"
+#   Native run with Docker Desktop:
+#       socket = "/var/run/docker.sock"
+#   Inside a container via docker-compose.yml:
+#       socket = "/var/run/docker.sock"   # host socket mounted to this path
+socket = "/var/run/docker.sock"
 control_timeout_seconds = 60
 
 [sandbox]
@@ -23,8 +30,10 @@ agent_gid = 1000
 workspace_mount = "/home/agent"
 
 [workspace]
-# Where per-workspace persistent state lives on the host. Point this at the
-# external SSD. Each workspace_id becomes a direct child directory.
+# Where per-workspace persistent state lives. When running in Docker,
+# this MUST be the same absolute path on host and in the container
+# (see docker-compose.yml's bind-mount line) so Docker-resolved bind
+# paths into sandbox containers are valid.
 root = "/Volumes/external/scriptorium-state"
 
 [tos]

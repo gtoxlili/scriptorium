@@ -112,6 +112,9 @@ src/
   fetch.rs                  URL-to-workspace download + SSRF guard
   oss.rs                    S3-compatible upload + signed-URL presign
   tools.rs                  AI-facing tool descriptors + arg/result types
+docker/service.Dockerfile   Service runtime image (multi-stage Rust build)
+docker-compose.yml          Reference Docker deployment
+.env.example                Compose env vars template
 docker/sandbox.Dockerfile   The fat sandbox image
 deploy/config.example.toml  Example service configuration
 docs/architecture.md        Design decisions and boundaries
@@ -129,19 +132,45 @@ docs/architecture.md        Design decisions and boundaries
   S3, Tencent COS, MinIO, Cloudflare R2, ...) configured under `[tos]` —
   `UploadToOSS` signed URLs are how artifacts get delivered to end users.
 
-## Build
+## Deployment
+
+Two supported shapes. On macOS, **Docker Compose is preferred** — the
+service inherits OrbStack's already-granted access to external volumes,
+so no TCC prompt each time the service reads from a mounted SSD. On
+Linux, either shape works; native binary + systemd is usually simpler.
+
+### Docker Compose (recommended on macOS)
+
+```bash
+cp .env.example .env              # then edit SCRIPTORIUM_WORKSPACE_ROOT
+cp deploy/config.example.toml deploy/config.toml
+# Edit deploy/config.toml — fill [tos] credentials, confirm [workspace].root
+# matches SCRIPTORIUM_WORKSPACE_ROOT in .env. Set docker.socket = "/var/run/docker.sock"
+# (the compose file mounts OrbStack's socket there).
+chmod 600 deploy/config.toml      # TOS creds — don't leave this world-readable
+
+docker compose up -d --build      # first build ~1-2 min; incremental seconds
+docker compose logs -f            # tail logs
+docker compose down               # stop + remove
+```
+
+The gRPC server is exposed on `127.0.0.1:50051`. OrbStack handles both
+the nested Docker socket (scriptorium spawns sandbox containers via the
+host daemon) and the file-sharing layer for the workspace bind-mount.
+
+### Native binary
 
 ```bash
 cargo build --release
-```
-
-## Run
-
-```bash
 cp deploy/config.example.toml deploy/config.toml
-# Edit deploy/config.toml — set docker.socket and workspace.root for your host.
-cargo run --release -- --config deploy/config.toml
+# Edit deploy/config.toml — set docker.socket to your OrbStack path,
+# workspace.root to a host path, and [tos] credentials.
+./target/release/scriptorium --config deploy/config.toml
 ```
+
+For a long-running service under `launchd`, see `docs/architecture.md`.
+Note that native runs on macOS can trigger TCC prompts for external
+volumes — the Docker deployment sidesteps that.
 
 ## Build the sandbox image
 

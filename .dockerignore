@@ -1,0 +1,13 @@
+target/
+.git/
+.github/
+tests/
+docker/
+!docker/service.Dockerfile
+docker-compose*.yml
+.env
+.env.*
+README.md
+LICENSE
+docs/
+*.md

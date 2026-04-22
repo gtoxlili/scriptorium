@@ -1,0 +1,48 @@
+# Docker deployment for scriptorium. Preferred on macOS because the
+# sandbox process runs inside OrbStack's Linux VM, which already has
+# TCC approval for external volumes — you don't get the "scriptorium
+# wants to access Removable Volumes" popup that plain launchd hits.
+#
+# Required env vars (copy .env.example → .env and edit):
+#   SCRIPTORIUM_WORKSPACE_ROOT   absolute path to workspace state dir.
+#                                MUST be the same path on host and in
+#                                container (bind-mount maps 1:1) so
+#                                sandbox-container bind paths resolve.
+#
+# Optional:
+#   SCRIPTORIUM_DOCKER_SOCK      defaults to $HOME/.orbstack/run/docker.sock
+#   SCRIPTORIUM_CONFIG           defaults to ./deploy/config.toml
+#   SCRIPTORIUM_PORT             defaults to 50051 on 127.0.0.1
+#
+# Start:
+#   docker compose up -d --build
+#   docker compose logs -f
+# Stop:
+#   docker compose down
+
+services:
+  scriptorium:
+    build:
+      context: .
+      dockerfile: docker/service.Dockerfile
+    image: scriptorium:latest
+    container_name: scriptorium
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${SCRIPTORIUM_PORT:-50051}:50051"
+    environment:
+      RUST_LOG: "info,bollard=warn"
+    volumes:
+      # Host Docker socket — OrbStack on macOS. Scriptorium creates
+      # sandbox containers via this socket as siblings of itself.
+      - "${SCRIPTORIUM_DOCKER_SOCK:-${HOME}/.orbstack/run/docker.sock}:/var/run/docker.sock"
+
+      # Workspace state root. The path MUST be identical on both sides
+      # — when scriptorium tells Docker to bind-mount a workspace dir
+      # into a sandbox container, Docker resolves that path against the
+      # host filesystem, not the scriptorium container's.
+      - "${SCRIPTORIUM_WORKSPACE_ROOT:?SCRIPTORIUM_WORKSPACE_ROOT must be set in .env}:${SCRIPTORIUM_WORKSPACE_ROOT}"
+
+      # Service config (read-only). Contains TOS credentials — keep the
+      # file at mode 0600 on the host.
+      - "${SCRIPTORIUM_CONFIG:-./deploy/config.toml}:/etc/scriptorium/config.toml:ro"

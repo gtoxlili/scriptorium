@@ -14,5 +14,6 @@
 .DS_Store
 
 # Local config & runtime state
-/deploy/config.local.toml
+/deploy/config*.toml
+!/deploy/config.example.toml
 /sandbox-state/
