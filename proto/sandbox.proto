@@ -8,10 +8,11 @@ package scriptorium.v1;
 // state lives in an on-disk workspace keyed by an opaque caller-provided
 // identifier.
 //
-// Data flow philosophy: scriptorium is *not* a file transfer proxy.
-// Inputs come into the workspace via HTTP (`FetchIntoWorkspace`), outputs
-// are delivered via object storage (`UploadToOSS`). Callers never shuttle
-// raw bytes through gRPC — they move URLs.
+// Data flow philosophy:
+//   - Internet/user-facing ingress still prefers URLs (`FetchIntoWorkspace`).
+//   - User-facing delivery still prefers object storage (`UploadToOSS`).
+//   - Host-integrated callers may directly stream bytes in/out of a workspace
+//     for local handoff flows that should not detour through object storage.
 service Sandbox {
   // ─── Core exec ─────────────────────────────────────────────────────────
   rpc Exec(ExecRequest) returns (ExecResponse);
@@ -26,6 +27,16 @@ service Sandbox {
   // it to the configured object store. Returns a signed download URL that
   // the caller can hand to the end user as a delivery artifact.
   rpc UploadToOSS(UploadRequest) returns (UploadResponse);
+
+  // ImportWorkspaceObject streams bytes directly into a workspace path.
+  // Intended for trusted host bridges moving local files into the sandbox
+  // without routing through HTTP/object storage.
+  rpc ImportWorkspaceObject(stream ImportWorkspaceObjectRequest) returns (ImportWorkspaceObjectResponse);
+
+  // ExportWorkspaceObject streams a workspace file or packaged directory
+  // back to the caller. Intended for trusted host bridges moving local
+  // files out of the sandbox without routing through object storage.
+  rpc ExportWorkspaceObject(ExportWorkspaceObjectRequest) returns (stream ExportWorkspaceObjectResponse);
 
   // ListFiles enumerates a workspace directory. Helpful for LLMs that
   // want to pick artifacts to deliver.
@@ -151,6 +162,59 @@ message UploadResponse {
   // caller is registering this as an attachment row.
   string basename = 6;
   reserved 1;  // previously `url` for signed download URL
+}
+
+enum WorkspaceObjectEncoding {
+  WORKSPACE_OBJECT_ENCODING_UNSPECIFIED = 0;
+  WORKSPACE_OBJECT_ENCODING_RAW = 1;
+  WORKSPACE_OBJECT_ENCODING_TAR_GZ = 2;
+}
+
+message ImportWorkspaceObjectHeader {
+  string workspace_id = 1;
+  string tenant_id = 2;
+  // Path relative to the workspace root. Files land exactly here.
+  // When encoding = TAR_GZ, this path becomes the extracted directory root.
+  string target_path = 3;
+  WorkspaceObjectEncoding encoding = 4;
+  string content_type = 5;
+}
+
+message ImportWorkspaceObjectRequest {
+  oneof payload {
+    ImportWorkspaceObjectHeader header = 1;
+    bytes chunk = 2;
+  }
+}
+
+message ImportWorkspaceObjectResponse {
+  uint64 bytes_written = 1;
+  string content_type = 2;
+}
+
+message ExportWorkspaceObjectRequest {
+  string workspace_id = 1;
+  string tenant_id = 2;
+  // Path relative to the workspace root.
+  string source_path = 3;
+  // RAW expects a file. TAR_GZ expects a directory and returns a tar.gz stream.
+  WorkspaceObjectEncoding encoding = 4;
+}
+
+message ExportWorkspaceObjectHeader {
+  string source_path = 1;
+  string basename = 2;
+  WorkspaceObjectEncoding encoding = 3;
+  string content_type = 4;
+  uint64 size_bytes = 5;
+  string sha256_hex = 6;
+}
+
+message ExportWorkspaceObjectResponse {
+  oneof payload {
+    ExportWorkspaceObjectHeader header = 1;
+    bytes chunk = 2;
+  }
 }
 
 message ListFilesRequest {

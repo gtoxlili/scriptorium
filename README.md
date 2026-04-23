@@ -39,10 +39,13 @@ the same way an application server orchestrates request handlers.
       │  UploadToOSS(path, compress?) ───▶│  tar.gz if dir,  ──────────────────────────▶ │
       │  ◀──── object_key + metadata ──   │  aws-sdk-s3 PUT.                             │
       │                                   │                                              │
+      │  Import/ExportWorkspaceObject ───▶│  direct byte streaming for trusted           │
+      │  ◀────── chunks + metadata ───    │  host-bridge handoff flows.                  │
+      │                                   │                                              │
       │  (caller resolves object_key to a permanent URL via its own                      │
       │   attachment system — scriptorium does not presign.)                             │
 
-  ListTools / CallTool: LLM-shaped convenience wrappers over the three
+  ListTools / CallTool: LLM-shaped convenience wrappers over the core
   primitives above — same semantics, OpenAI function-call descriptors.
 ```
 
@@ -76,9 +79,11 @@ Full design rationale: [`docs/architecture.md`](docs/architecture.md).
   aligned with Volcano Engine TOS) and returning the permanent
   `object_key`. Callers mint user-facing URLs from that key through
   their own attachment system.
-- **AI-facing tool layer** — `ListTools` publishes three OpenAI-compatible
-  descriptors (`execute_shell`, `fetch`, `deliver`); `CallTool` dispatches
-  to the primitives using the same implementation path.
+- **AI-facing tool layer** — `ListTools` publishes four OpenAI-compatible
+  descriptors (`execute_shell`, `deliver`, and two workspace-sandbox
+  exchange tools). `CallTool` routes `execute_shell` / `deliver` through
+  the same implementation path as the primitives; the exchange tools are
+  intended for a host bridge layered above scriptorium.
 - **Fat sandbox image** with Python, Node 20, Chromium/Playwright, FFmpeg,
   ImageMagick, and common CLIs pre-installed — no runtime `apt install` required.
 - **Workspace id validation** (`[A-Za-z0-9_-]{1,128}`) with host-side path

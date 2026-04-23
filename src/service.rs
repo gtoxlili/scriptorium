@@ -8,7 +8,12 @@ use std::{
 };
 
 use futures::{Stream, StreamExt, stream};
-use tokio::{fs, sync::Semaphore};
+use sha2::{Digest, Sha256};
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::Semaphore,
+};
 use tonic::{Request, Response, Status};
 
 use crate::{
@@ -18,15 +23,20 @@ use crate::{
     oss::{OssClient, guess_content_type},
     pb::{
         CallToolRequest, CallToolResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
-        ExecEvent, ExecFinished, ExecRequest, ExecResponse, ExecStarted, FetchRequest,
-        FetchResponse, FileInfo, HealthRequest, HealthResponse, ListFilesRequest,
+        ExecEvent, ExecFinished, ExecRequest, ExecResponse, ExecStarted,
+        ExportWorkspaceObjectHeader, ExportWorkspaceObjectRequest, ExportWorkspaceObjectResponse,
+        FetchRequest, FetchResponse, FileInfo, HealthRequest, HealthResponse,
+        ImportWorkspaceObjectRequest, ImportWorkspaceObjectResponse, ListFilesRequest,
         ListFilesResponse, ListToolsRequest, ListToolsResponse, ResourceLimits, StderrChunk,
-        StdoutChunk, UploadRequest, UploadResponse, exec_event, sandbox_server::Sandbox,
+        StdoutChunk, UploadRequest, UploadResponse, WorkspaceObjectEncoding, exec_event,
+        export_workspace_object_response, import_workspace_object_request, sandbox_server::Sandbox,
     },
     runtime::{DockerRuntime, ExecParams, StreamEvent},
     tools,
     workspace::WorkspaceManager,
 };
+
+const WORKSPACE_TRANSFER_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub struct SandboxService {
@@ -84,8 +94,8 @@ impl SandboxService {
     //
     // The three `do_*` functions are the implementation truth. Both the
     // primitive RPCs (Exec / FetchIntoWorkspace / UploadToOSS) and the
-    // tool-layer RPCs (CallTool) call into them, so the behaviour cannot
-    // drift between the two surfaces.
+    // tool-layer RPCs (CallTool) call into the subset they expose, so the
+    // behaviour cannot drift between the two surfaces.
 
     async fn build_exec_params(&self, req: ExecRequest) -> Result<ExecParams> {
         let sandbox = self.runtime.sandbox_cfg();
@@ -262,6 +272,176 @@ impl SandboxService {
             basename: effective_basename,
         })
     }
+
+    async fn do_import_workspace_object(
+        &self,
+        mut stream: tonic::Streaming<ImportWorkspaceObjectRequest>,
+    ) -> std::result::Result<ImportWorkspaceObjectResponse, Status> {
+        let first = stream
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("import_workspace_object requires a header"))?;
+        let header = match first.payload {
+            Some(import_workspace_object_request::Payload::Header(header)) => header,
+            Some(import_workspace_object_request::Payload::Chunk(_)) => {
+                return Err(Status::invalid_argument(
+                    "import_workspace_object header must be the first message",
+                ));
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "import_workspace_object first message is empty",
+                ));
+            }
+        };
+
+        let encoding = WorkspaceObjectEncoding::try_from(header.encoding).unwrap_or_default();
+        let sandbox = self.runtime.sandbox_cfg();
+        self.workspaces
+            .ensure_home(&header.workspace_id, sandbox.agent_uid, sandbox.agent_gid)
+            .await?;
+        let target = self
+            .workspaces
+            .resolve_path(&header.workspace_id, &header.target_path)?;
+        fs::create_dir_all(target.parent().unwrap_or_else(|| Path::new("."))).await?;
+
+        let staging = build_workspace_transfer_temp_path(&target, "import");
+        let mut file = fs::File::create(&staging).await?;
+        let mut bytes_written = 0u64;
+
+        while let Some(msg) = stream.message().await? {
+            match msg.payload {
+                Some(import_workspace_object_request::Payload::Chunk(chunk)) => {
+                    file.write_all(&chunk).await?;
+                    bytes_written = bytes_written
+                        .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+                }
+                Some(import_workspace_object_request::Payload::Header(_)) => {
+                    return Err(Status::invalid_argument(
+                        "import_workspace_object header may only appear once",
+                    ));
+                }
+                None => {
+                    return Err(Status::invalid_argument(
+                        "import_workspace_object received an empty message",
+                    ));
+                }
+            }
+        }
+        file.flush().await?;
+        drop(file);
+
+        let import_result = match encoding {
+            WorkspaceObjectEncoding::Raw => {
+                replace_workspace_file_from_staging(staging.clone(), target.clone()).await?;
+                ImportWorkspaceObjectResponse {
+                    bytes_written,
+                    content_type: if header.content_type.trim().is_empty() {
+                        "application/octet-stream".to_string()
+                    } else {
+                        header.content_type
+                    },
+                }
+            }
+            WorkspaceObjectEncoding::TarGz => {
+                replace_workspace_directory_from_archive_path(staging.clone(), target.clone())
+                    .await?;
+                ImportWorkspaceObjectResponse {
+                    bytes_written,
+                    content_type: "application/gzip".to_string(),
+                }
+            }
+            WorkspaceObjectEncoding::Unspecified => {
+                let _ = fs::remove_file(&staging).await;
+                return Err(Status::invalid_argument(
+                    "import_workspace_object encoding is required",
+                ));
+            }
+        };
+
+        let _ = fs::remove_file(staging).await;
+        Ok(import_result)
+    }
+
+    async fn do_export_workspace_object(
+        &self,
+        req: ExportWorkspaceObjectRequest,
+    ) -> std::result::Result<PreparedWorkspaceExport, Status> {
+        if req.workspace_id.is_empty() {
+            return Err(Status::invalid_argument("workspace_id is required"));
+        }
+        let source = self
+            .workspaces
+            .resolve_path(&req.workspace_id, &req.source_path)?;
+        let meta = fs::metadata(&source).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Status::not_found(format!("no such path: {}", req.source_path))
+            } else {
+                Status::from(Error::Io(e))
+            }
+        })?;
+
+        let encoding = WorkspaceObjectEncoding::try_from(req.encoding).unwrap_or_default();
+        let (payload_path, basename, content_type, cleanup) = match encoding {
+            WorkspaceObjectEncoding::Raw => {
+                if meta.is_dir() {
+                    return Err(Status::invalid_argument(
+                        "export_workspace_object raw encoding expects a file",
+                    ));
+                }
+                let basename = source.file_name().map_or_else(
+                    || "artifact".to_string(),
+                    |s| s.to_string_lossy().into_owned(),
+                );
+                (
+                    source.clone(),
+                    basename,
+                    guess_content_type(&source).to_string(),
+                    None,
+                )
+            }
+            WorkspaceObjectEncoding::TarGz => {
+                if !meta.is_dir() {
+                    return Err(Status::invalid_argument(
+                        "export_workspace_object tar_gz encoding expects a directory",
+                    ));
+                }
+                let basename = source.file_name().map_or_else(
+                    || "workspace".to_string(),
+                    |s| s.to_string_lossy().into_owned(),
+                );
+                let out_basename = format!("{basename}.tar.gz");
+                let tmp = tar_gz_into_temp(&source, &out_basename).await?;
+                (
+                    tmp.clone(),
+                    out_basename,
+                    "application/gzip".to_string(),
+                    Some(TempFileGuard(tmp)),
+                )
+            }
+            WorkspaceObjectEncoding::Unspecified => {
+                return Err(Status::invalid_argument(
+                    "export_workspace_object encoding is required",
+                ));
+            }
+        };
+
+        let size_bytes = fs::metadata(&payload_path).await?.len();
+        let sha256_hex = sha256_file(&payload_path).await?;
+
+        Ok(PreparedWorkspaceExport {
+            header: ExportWorkspaceObjectHeader {
+                source_path: req.source_path,
+                basename,
+                encoding: encoding as i32,
+                content_type,
+                size_bytes,
+                sha256_hex,
+            },
+            payload_path,
+            cleanup,
+        })
+    }
 }
 
 /// Holds a semaphore permit for the lifetime of an exec call. Dropped at
@@ -272,6 +452,19 @@ struct OwnedExecPermit {
 
 type ExecStreamOut =
     Pin<Box<dyn Stream<Item = std::result::Result<ExecEvent, Status>> + Send + 'static>>;
+type ExportWorkspaceObjectOut = Pin<
+    Box<
+        dyn Stream<Item = std::result::Result<ExportWorkspaceObjectResponse, Status>>
+            + Send
+            + 'static,
+    >,
+>;
+
+struct PreparedWorkspaceExport {
+    header: ExportWorkspaceObjectHeader,
+    payload_path: PathBuf,
+    cleanup: Option<TempFileGuard>,
+}
 
 #[tonic::async_trait]
 impl Sandbox for SandboxService {
@@ -360,6 +553,47 @@ impl Sandbox for SandboxService {
             )
             .await?;
         Ok(Response::new(resp))
+    }
+
+    async fn import_workspace_object(
+        &self,
+        req: Request<tonic::Streaming<ImportWorkspaceObjectRequest>>,
+    ) -> std::result::Result<Response<ImportWorkspaceObjectResponse>, Status> {
+        let resp = self.do_import_workspace_object(req.into_inner()).await?;
+        Ok(Response::new(resp))
+    }
+
+    type ExportWorkspaceObjectStream = ExportWorkspaceObjectOut;
+    async fn export_workspace_object(
+        &self,
+        req: Request<ExportWorkspaceObjectRequest>,
+    ) -> std::result::Result<Response<Self::ExportWorkspaceObjectStream>, Status> {
+        let prepared = self.do_export_workspace_object(req.into_inner()).await?;
+        let PreparedWorkspaceExport {
+            header,
+            payload_path,
+            cleanup,
+        } = prepared;
+        let stream = async_stream::try_stream! {
+            yield ExportWorkspaceObjectResponse {
+                payload: Some(export_workspace_object_response::Payload::Header(header)),
+            };
+
+            let mut file = fs::File::open(&payload_path).await?;
+            let mut buf = vec![0u8; WORKSPACE_TRANSFER_CHUNK_SIZE];
+            loop {
+                let n = file.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                yield ExportWorkspaceObjectResponse {
+                    payload: Some(export_workspace_object_response::Payload::Chunk(buf[..n].to_vec())),
+                };
+            }
+
+            drop(cleanup);
+        };
+        Ok(Response::new(Box::pin(stream) as ExportWorkspaceObjectOut))
     }
 
     async fn list_files(
@@ -458,31 +692,6 @@ impl Sandbox for SandboxService {
                 };
                 encode_result(&result)?
             }
-            tools::TOOL_FETCH => {
-                let args: tools::FetchArgs = serde_json::from_str(args_json)
-                    .map_err(|e| Status::invalid_argument(format!("fetch args: {e}")))?;
-                let timeout_seconds = if inner.timeout_seconds > 0 {
-                    inner.timeout_seconds
-                } else {
-                    args.timeout_seconds
-                };
-                let resp = self
-                    .do_fetch(
-                        &inner.workspace_id,
-                        &args.url,
-                        &args.target_path,
-                        &args.headers,
-                        timeout_seconds,
-                    )
-                    .await?;
-                let result = tools::FetchResult {
-                    target_path: args.target_path,
-                    bytes_written: resp.bytes_written,
-                    content_type: resp.content_type,
-                    http_status: resp.http_status,
-                };
-                encode_result(&result)?
-            }
             tools::TOOL_DELIVER => {
                 let args: tools::DeliverArgs = serde_json::from_str(args_json)
                     .map_err(|e| Status::invalid_argument(format!("deliver args: {e}")))?;
@@ -503,6 +712,17 @@ impl Sandbox for SandboxService {
                     sha256_hex: resp.sha256_hex,
                 };
                 encode_result(&result)?
+            }
+            tools::TOOL_COPY_WORKSPACE_SANDBOX_TO_EXECUTION_SANDBOX
+            | tools::TOOL_COPY_EXECUTION_SANDBOX_TO_WORKSPACE_SANDBOX => {
+                return Ok(Response::new(CallToolResponse {
+                    result_json: String::new(),
+                    is_error: true,
+                    error_message: format!(
+                        "tool {} requires an agent-core host bridge; direct scriptorium calls are unsupported",
+                        inner.tool_name
+                    ),
+                }));
             }
             other => {
                 return Ok(Response::new(CallToolResponse {
@@ -533,6 +753,145 @@ impl Drop for TempFileGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+fn build_workspace_transfer_temp_path(target: &Path, suffix: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0u64, |d| d.as_nanos() as u64);
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(".scriptorium-{suffix}-{nonce:x}.tmp"))
+}
+
+async fn replace_workspace_file_from_staging(staging: PathBuf, target: PathBuf) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    remove_path_if_exists(&target).await?;
+    fs::rename(staging, target).await?;
+    Ok(())
+}
+
+async fn remove_path_if_exists(target: &Path) -> Result<()> {
+    match fs::metadata(target).await {
+        Ok(meta) if meta.is_dir() => {
+            fs::remove_dir_all(target).await?;
+        }
+        Ok(_) => {
+            fs::remove_file(target).await?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+async fn replace_workspace_directory_from_archive_path(
+    staging: PathBuf,
+    target: PathBuf,
+) -> Result<()> {
+    let target_parent = target
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&target_parent).await?;
+    let extraction_root = build_workspace_transfer_temp_path(&target, "expand");
+    let target_clone = target.clone();
+    tokio::task::spawn_blocking(move || {
+        extract_archive_and_replace(staging, extraction_root, target_clone)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("extract archive join: {e}")))??;
+    Ok(())
+}
+
+async fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; WORKSPACE_TRANSFER_CHUNK_SIZE];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn extract_archive_and_replace(
+    staging: PathBuf,
+    extraction_root: PathBuf,
+    target: PathBuf,
+) -> Result<()> {
+    if extraction_root.exists() {
+        std::fs::remove_dir_all(&extraction_root)?;
+    }
+    std::fs::create_dir_all(&extraction_root)?;
+
+    let file = std::fs::File::open(&staging)?;
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+    archive.set_overwrite(true);
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let rel = entry.path()?;
+        let clean = rel.as_ref();
+        if clean.is_absolute()
+            || clean
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(Error::Other(format!(
+                "archive entry escapes target directory: {}",
+                rel.display()
+            )));
+        }
+        match entry.header().entry_type() {
+            tar::EntryType::Regular | tar::EntryType::Directory => {}
+            _ => {
+                return Err(Error::Other(format!(
+                    "unsupported archive entry type: {}",
+                    rel.display()
+                )));
+            }
+        }
+        entry.unpack_in(&extraction_root)?;
+    }
+
+    remove_path_if_exists_blocking(&target)?;
+
+    let mut entries =
+        std::fs::read_dir(&extraction_root)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    if entries.len() == 1 {
+        let source = entries.remove(0).path();
+        if source.is_dir() {
+            std::fs::rename(source, &target)?;
+            let _ = std::fs::remove_dir_all(&extraction_root);
+            let _ = std::fs::remove_file(&staging);
+            return Ok(());
+        }
+    }
+
+    std::fs::create_dir_all(&target)?;
+    for entry in std::fs::read_dir(&extraction_root)? {
+        let entry = entry?;
+        std::fs::rename(entry.path(), target.join(entry.file_name()))?;
+    }
+    let _ = std::fs::remove_dir_all(&extraction_root);
+    let _ = std::fs::remove_file(&staging);
+    Ok(())
+}
+
+fn remove_path_if_exists_blocking(target: &Path) -> Result<()> {
+    match std::fs::metadata(target) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(target)?,
+        Ok(_) => std::fs::remove_file(target)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
 }
 
 /// Produce a tar.gz of `source` into a unique file under the OS temp dir

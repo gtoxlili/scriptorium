@@ -88,16 +88,22 @@ Mixing the two would let any script in the sandbox read any credential, and
 would couple credential lifetime to sandbox GC. We keep them separated as a
 hard boundary.
 
-### Data flow: URLs in, object keys out
+### Data flow: URLs/object keys for user-facing transfers, direct streaming for host bridges
 
-Scriptorium deliberately does **not** shuttle file bytes through gRPC.
-Inputs land via `FetchIntoWorkspace(url, target_path)` — a host-side
-reqwest that streams the body into the workspace under an SSRF guard.
-Outputs leave via `UploadToOSS(source_path, compress?)` — the service
-tars + gzips directories as needed, uploads to an S3-compatible object
-store (Volcano Engine TOS by default), and returns the **permanent
-`object_key`** (plus size / content-type / sha256 / basename) — but
-**no signed URL**.
+User-facing ingress still prefers URLs: `FetchIntoWorkspace(url,
+target_path)` is a host-side reqwest that streams the body into the
+workspace under an SSRF guard.
+
+User-facing delivery still prefers object storage:
+`UploadToOSS(source_path, compress?)` tars + gzips directories as needed,
+uploads to an S3-compatible object store (Volcano Engine TOS by default),
+and returns the **permanent `object_key`** (plus size / content-type /
+sha256 / basename) — but **no signed URL**.
+
+For trusted host-integrated callers, scriptorium also exposes direct
+workspace import/export RPCs that stream bytes over gRPC. These are
+meant for local handoff flows such as a host application's own workspace
+bridge; they are not the default internet-facing ingestion/delivery path.
 
 The signed-URL concern belongs to the caller, not to scriptorium.
 Presigned URLs are TTL-limited by design, and artifacts the user wants
@@ -176,11 +182,14 @@ the pool is saturated, requests queue for up to
 from all simultaneously reserving their per-container 8 GiB memory cap
 and triggering an OOM on the host.
 
-`FetchIntoWorkspace`, `UploadToOSS`, `ListFiles`, and `DeleteWorkspace`
-do **not** consume permits — they are host-side I/O with no container
-cost. `CallTool` routes through the same `do_exec_oneshot` / `do_fetch`
-/ `do_upload` helpers as the primitives, so the semaphore gates
-`execute_shell` consistently whichever surface the caller uses.
+`FetchIntoWorkspace`, `UploadToOSS`, `ImportWorkspaceObject`,
+`ExportWorkspaceObject`, `ListFiles`, and `DeleteWorkspace` do **not**
+consume permits — they are host-side I/O with no container cost.
+`CallTool` routes `execute_shell` / `deliver` through the same
+`do_exec_oneshot` / `do_upload` helpers as the primitives, so the
+semaphore gates `execute_shell` consistently whichever surface the
+caller uses. The two workspace-sandbox exchange descriptors are
+catalog-only at the scriptorium layer and expect a host bridge above it.
 
 `Health` reports `exec_permits_available` for observability.
 
@@ -204,9 +213,11 @@ Primitive RPCs (`Exec`, `ExecStream`, `FetchIntoWorkspace`,
 `UploadToOSS`, `ListFiles`, `DeleteWorkspace`, `Health`) are the
 protocol-level truth. A second, AI-facing tool layer (`ListTools`,
 `CallTool`) sits in front of them: it publishes OpenAI-function-call /
-MCP-shaped descriptors for three tools — `execute_shell`, `fetch`,
-`deliver` — and routes invocations through the same `do_*` helpers that
-back the primitive handlers. There is no independent code path.
+MCP-shaped descriptors for four tools — `execute_shell`, `deliver`, and
+two workspace-sandbox exchange tools. `execute_shell` / `deliver` route
+through the same `do_*` helpers that back the primitive handlers; the
+exchange tools advertise host-bridge contracts and return an explicit
+error when invoked directly against bare scriptorium.
 
 The split exists because engine callers want the streaming-capable
 primitives directly, while LLM callers benefit from a thinner catalog

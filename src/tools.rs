@@ -4,7 +4,7 @@
 //! shape. `CallTool` is a thin router over the same primitives that
 //! `Exec`, `FetchIntoWorkspace`, and `UploadToOSS` expose — agent-core (or
 //! any other consumer) can skip the primitives entirely and drive the
-//! service through these three tools.
+//! service through these tools.
 //!
 //! Descriptions below are deliberately verbose. They are the **only**
 //! context the LLM has when deciding whether/how to call a tool, so every
@@ -16,8 +16,11 @@ use serde::{Deserialize, Serialize};
 use crate::pb::ToolDescriptor;
 
 pub const TOOL_EXECUTE_SHELL: &str = "execute_shell";
-pub const TOOL_FETCH: &str = "fetch";
 pub const TOOL_DELIVER: &str = "deliver";
+pub const TOOL_COPY_WORKSPACE_SANDBOX_TO_EXECUTION_SANDBOX: &str =
+    "copy_workspace_sandbox_to_execution_sandbox";
+pub const TOOL_COPY_EXECUTION_SANDBOX_TO_WORKSPACE_SANDBOX: &str =
+    "copy_execution_sandbox_to_workspace_sandbox";
 
 /// The catalog returned by `ListTools`.
 pub fn descriptors() -> Vec<ToolDescriptor> {
@@ -28,14 +31,19 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
             parameters_schema: EXECUTE_SHELL_SCHEMA.to_string(),
         },
         ToolDescriptor {
-            name: TOOL_FETCH.to_string(),
-            description: FETCH_DESCRIPTION.to_string(),
-            parameters_schema: FETCH_SCHEMA.to_string(),
-        },
-        ToolDescriptor {
             name: TOOL_DELIVER.to_string(),
             description: DELIVER_DESCRIPTION.to_string(),
             parameters_schema: DELIVER_SCHEMA.to_string(),
+        },
+        ToolDescriptor {
+            name: TOOL_COPY_WORKSPACE_SANDBOX_TO_EXECUTION_SANDBOX.to_string(),
+            description: COPY_WORKSPACE_SANDBOX_TO_EXECUTION_SANDBOX_DESCRIPTION.to_string(),
+            parameters_schema: COPY_WORKSPACE_SANDBOX_TO_EXECUTION_SANDBOX_SCHEMA.to_string(),
+        },
+        ToolDescriptor {
+            name: TOOL_COPY_EXECUTION_SANDBOX_TO_WORKSPACE_SANDBOX.to_string(),
+            description: COPY_EXECUTION_SANDBOX_TO_WORKSPACE_SANDBOX_DESCRIPTION.to_string(),
+            parameters_schema: COPY_EXECUTION_SANDBOX_TO_WORKSPACE_SANDBOX_SCHEMA.to_string(),
         },
     ]
 }
@@ -49,16 +57,6 @@ pub struct ExecuteShellArgs {
     pub timeout_seconds: u32,
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct FetchArgs {
-    pub url: String,
-    pub target_path: String,
-    #[serde(default)]
-    pub headers: std::collections::HashMap<String, String>,
-    #[serde(default)]
-    pub timeout_seconds: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,14 +77,6 @@ pub struct ExecuteShellResult {
     pub stderr: String,
     pub duration_ms: u64,
     pub timed_out: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct FetchResult {
-    pub target_path: String,
-    pub bytes_written: u64,
-    pub content_type: String,
-    pub http_status: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,39 +139,19 @@ For missing Python deps: `pip install --user <pkg>` (lands in \
 $HOME/.local, persists with the session). For Node: \
 `npm install --prefix $HOME/.local <pkg>`.
 
-Bring inputs in via the `fetch` tool (HTTP → $HOME) and hand outputs \
-to the user via the `deliver` tool ($HOME → object storage → URL).";
+Bring inputs in by downloading them inside the command itself (for \
+example with `curl`, `wget`, Python `requests`, or Node) or by working \
+on files already present in $HOME, and hand outputs to the user via the \
+`deliver` tool ($HOME → object storage → URL).
 
-const FETCH_DESCRIPTION: &str = "\
-Download an HTTP(S) URL directly into the sandbox workspace. Use this to \
-pull any user-supplied file (chat attachment URL, user-shared link, \
-third-party resource) into $HOME where `execute_shell` can work on it.
-
-Constraints
-───────────
-- Schemes: http, https only. No file://, ftp, ssh, data:, etc.
-- Max response body: 1 GiB — exceeding it fails fast mid-stream.
-- Follows up to 5 HTTP redirects.
-- Target IP must be public-routable. Rejected as SSRF: loopback (127/8), \
-RFC1918 (10/8, 172.16/12, 192.168/16), link-local (169.254/16), CGNAT \
-(100.64/10), IPv4 broadcast / docs / unspecified, IPv6 loopback (::1), \
-ULA (fc00::/7), IPv6 link-local (fe80::/10).
-- Default wall-clock: 60 s (override via `timeout_seconds`).
-
-Filesystem semantics
-────────────────────
-- `target_path` is resolved relative to $HOME and rejected if it \
-escapes via `..` or absolute paths.
-- Missing parent directories are created.
-- Existing files at that path are overwritten atomically.
-
-Returns `bytes_written`, server-declared `content_type`, and the final \
-`http_status`. Non-2xx statuses are reported as tool errors.
-
-Typical flow: user shares a PDF URL → fetch(url=<url>, \
-target_path=\"inputs/report.pdf\") → execute_shell(\"python3 \
-~/analyze.py ~/inputs/report.pdf > ~/outputs/summary.md\") → \
-deliver(path=\"outputs/summary.md\").";
+Large output handling
+─────────────────────
+Some hosts may spill oversized stdout/stderr into a brand-workspace \
+file under `sandbox/...` instead of inlining the entire streams. In that \
+case the result can contain `output_mode=\"workspace_spill\"`, \
+`workspace_path`, `char_count`, `line_count`, `preview`, and `message` \
+instead of full stdout/stderr. Use the host's normal workspace read/search \
+tools on `workspace_path` to inspect the full spill.";
 
 const DELIVER_DESCRIPTION: &str = "\
 Package a file or directory produced in the sandbox, upload it to \
@@ -229,6 +199,55 @@ deliver(path=\"outputs/summary.pdf\", label=\"Q3 revenue summary\") → \
 receives {url: \"https://...\", size_bytes: 245_760, ...} → reply to \
 the user with just the URL.";
 
+const COPY_WORKSPACE_SANDBOX_TO_EXECUTION_SANDBOX_DESCRIPTION: &str = "\
+Copy a file or directory from the brand workspace `sandbox/` exchange \
+folder into the execution sandbox workspace. Use this when a prior \
+workspace tool created or edited inputs under `sandbox/...` and shell work \
+now needs them inside $HOME.
+
+Rules
+─────
+- `source_path` MUST point to `sandbox/...` inside the brand workspace. \
+`extracts/...` is not valid here and stays read-only.
+- Files are copied as-is to `target_path` inside the execution sandbox.
+- Directories are packaged as tar.gz, transferred, then extracted so \
+`target_path` becomes the copied directory root.
+- Existing targets are replaced.
+
+Typical flow: write or edit `sandbox/prompt.txt` with workspace tools → \
+copy_workspace_sandbox_to_execution_sandbox(source_path=\"sandbox/prompt.txt\", \
+target_path=\"inputs/prompt.txt\") → execute_shell(...) reads \
+$HOME/inputs/prompt.txt.
+
+Execution note: the actual transfer is performed by the host bridge layered \
+above scriptorium. Direct calls against bare scriptorium without that \
+bridge will fail.";
+
+const COPY_EXECUTION_SANDBOX_TO_WORKSPACE_SANDBOX_DESCRIPTION: &str = "\
+Copy a file or directory from the execution sandbox back into the brand \
+workspace `sandbox/` exchange folder. Use this when shell work produced \
+an output that should be inspected, searched, or edited with the normal \
+workspace tools.
+
+Rules
+─────
+- `target_path` MUST point to `sandbox/...` inside the brand workspace.
+- `source_kind` must be `file` or `directory` because the execution \
+sandbox does not expose a separate stat tool.
+- Files are written directly to `target_path`.
+- Directories are uploaded as tar.gz, transferred back, then extracted so \
+`target_path` becomes the copied directory root.
+- Existing targets are replaced.
+
+Typical flow: execute_shell(...) writes $HOME/outputs/report.md → \
+copy_execution_sandbox_to_workspace_sandbox(source_path=\"outputs/report.md\", \
+source_kind=\"file\", target_path=\"sandbox/report.md\") → inspect or \
+rewrite `sandbox/report.md` with workspace tools.
+
+Execution note: the actual transfer is performed by the host bridge layered \
+above scriptorium. Direct calls against bare scriptorium without that \
+bridge will fail.";
+
 // ─── JSON Schema constants ────────────────────────────────────────────────
 // Per-parameter descriptions stay concise; the big-picture capability +
 // constraints live in the tool descriptions above.
@@ -254,31 +273,6 @@ const EXECUTE_SHELL_SCHEMA: &str = r#"{
   "required": ["command"]
 }"#;
 
-const FETCH_SCHEMA: &str = r#"{
-  "type": "object",
-  "properties": {
-    "url": {
-      "type": "string",
-      "description": "HTTP(S) URL to download. Private / loopback / link-local / CGNAT addresses are rejected as SSRF."
-    },
-    "target_path": {
-      "type": "string",
-      "description": "Path inside the workspace (relative to $HOME, e.g. \"inputs/report.pdf\") to write the body to. Parent dirs auto-created; existing files overwritten."
-    },
-    "headers": {
-      "type": "object",
-      "additionalProperties": { "type": "string" },
-      "description": "Extra request headers, e.g. {\"Authorization\": \"Bearer ...\"}."
-    },
-    "timeout_seconds": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "Total wall-clock cap for the whole download. Omit or 0 for the server default (60s)."
-    }
-  },
-  "required": ["url", "target_path"]
-}"#;
-
 const DELIVER_SCHEMA: &str = r#"{
   "type": "object",
   "properties": {
@@ -298,26 +292,67 @@ const DELIVER_SCHEMA: &str = r#"{
   "required": ["path"]
 }"#;
 
+const COPY_WORKSPACE_SANDBOX_TO_EXECUTION_SANDBOX_SCHEMA: &str = r#"{
+  "type": "object",
+  "properties": {
+    "source_path": {
+      "type": "string",
+      "description": "Workspace-relative source path under `sandbox/`. May point to a file or a directory."
+    },
+    "target_path": {
+      "type": "string",
+      "description": "Destination path inside the execution sandbox workspace. Files land exactly here; directories are extracted so this path becomes the copied directory root."
+    }
+  },
+  "required": ["source_path", "target_path"]
+}"#;
+
+const COPY_EXECUTION_SANDBOX_TO_WORKSPACE_SANDBOX_SCHEMA: &str = r#"{
+  "type": "object",
+  "properties": {
+    "source_path": {
+      "type": "string",
+      "description": "Path inside the execution sandbox to copy from."
+    },
+    "source_kind": {
+      "type": "string",
+      "enum": ["file", "directory"],
+      "description": "Whether source_path points to a file or a directory."
+    },
+    "target_path": {
+      "type": "string",
+      "description": "Workspace-relative destination path under `sandbox/`."
+    }
+  },
+  "required": ["source_path", "source_kind", "target_path"]
+}"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn all_schemas_are_valid_json() {
-        for s in [EXECUTE_SHELL_SCHEMA, FETCH_SCHEMA, DELIVER_SCHEMA] {
+        for s in [
+            EXECUTE_SHELL_SCHEMA,
+            DELIVER_SCHEMA,
+            COPY_WORKSPACE_SANDBOX_TO_EXECUTION_SANDBOX_SCHEMA,
+            COPY_EXECUTION_SANDBOX_TO_WORKSPACE_SANDBOX_SCHEMA,
+        ] {
             serde_json::from_str::<serde_json::Value>(s)
                 .unwrap_or_else(|e| panic!("invalid schema: {e}\n{s}"));
         }
     }
 
     #[test]
-    fn descriptors_list_three_tools() {
+    fn descriptors_list_four_tools() {
         let d = descriptors();
-        assert_eq!(d.len(), 3);
+        assert_eq!(d.len(), 4);
         let names: Vec<_> = d.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&TOOL_EXECUTE_SHELL));
-        assert!(names.contains(&TOOL_FETCH));
         assert!(names.contains(&TOOL_DELIVER));
+        assert!(names.contains(&TOOL_COPY_WORKSPACE_SANDBOX_TO_EXECUTION_SANDBOX));
+        assert!(names.contains(&TOOL_COPY_EXECUTION_SANDBOX_TO_WORKSPACE_SANDBOX));
     }
 
     #[test]
@@ -344,10 +379,10 @@ mod tests {
             shell.contains("UID 1000") || shell.contains("Non-root"),
             "exec must flag non-root"
         );
-
-        let fetch = by_name(TOOL_FETCH);
-        assert!(fetch.contains("SSRF"), "fetch must mention SSRF");
-        assert!(fetch.contains("1 GiB"), "fetch must mention body cap");
+        assert!(
+            shell.contains("workspace_path"),
+            "exec must mention host-side spill handling"
+        );
 
         let deliver = by_name(TOOL_DELIVER);
         assert!(
@@ -357,6 +392,18 @@ mod tests {
         assert!(
             deliver.contains("ONLY"),
             "deliver must tell LLM which field to paste"
+        );
+
+        let push = by_name(TOOL_COPY_WORKSPACE_SANDBOX_TO_EXECUTION_SANDBOX);
+        assert!(
+            push.contains("sandbox/..."),
+            "workspace->execution bridge must constrain source_path"
+        );
+
+        let pull = by_name(TOOL_COPY_EXECUTION_SANDBOX_TO_WORKSPACE_SANDBOX);
+        assert!(
+            pull.contains("source_kind"),
+            "execution->workspace bridge must explain source_kind"
         );
     }
 }

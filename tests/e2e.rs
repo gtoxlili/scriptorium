@@ -474,7 +474,7 @@ async fn upload_to_oss_roundtrips_through_signed_url() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires local docker + scriptorium-sandbox image"]
-async fn list_tools_advertises_three_tools() {
+async fn list_tools_advertises_four_tools() {
     let (addr, _tmp) = spawn_service().await;
     let mut client = client(addr).await;
     let resp = client
@@ -483,10 +483,11 @@ async fn list_tools_advertises_three_tools() {
         .unwrap()
         .into_inner();
     let names: Vec<String> = resp.tools.iter().map(|t| t.name.clone()).collect();
-    assert_eq!(names.len(), 3, "expected 3 tools, got {names:?}");
+    assert_eq!(names.len(), 4, "expected 4 tools, got {names:?}");
     assert!(names.contains(&"execute_shell".to_string()));
-    assert!(names.contains(&"fetch".to_string()));
     assert!(names.contains(&"deliver".to_string()));
+    assert!(names.contains(&"copy_workspace_sandbox_to_execution_sandbox".to_string()));
+    assert!(names.contains(&"copy_execution_sandbox_to_workspace_sandbox".to_string()));
     // Every schema must be valid JSON.
     for t in &resp.tools {
         serde_json::from_str::<serde_json::Value>(&t.parameters_schema)
@@ -538,6 +539,54 @@ async fn call_tool_rejects_unknown_tool() {
         .into_inner();
     assert!(resp.is_error);
     assert!(resp.error_message.contains("unknown tool"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires local docker + scriptorium-sandbox image"]
+async fn call_tool_fetch_is_no_longer_advertised_or_routable() {
+    let (addr, _tmp) = spawn_service().await;
+    let mut client = client(addr).await;
+    let args = serde_json::json!({
+        "url": "https://example.com/report.pdf",
+        "target_path": "inputs/report.pdf",
+    });
+    let resp = client
+        .call_tool(CallToolRequest {
+            workspace_id: "tool-fetch".into(),
+            tenant_id: "t".into(),
+            tool_name: "fetch".into(),
+            arguments_json: args.to_string(),
+            timeout_seconds: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.is_error);
+    assert!(resp.error_message.contains("unknown tool"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires local docker + scriptorium-sandbox image"]
+async fn call_tool_workspace_exchange_requires_host_bridge() {
+    let (addr, _tmp) = spawn_service().await;
+    let mut client = client(addr).await;
+    let args = serde_json::json!({
+        "source_path": "sandbox/input.txt",
+        "target_path": "inputs/input.txt",
+    });
+    let resp = client
+        .call_tool(CallToolRequest {
+            workspace_id: "tool-bridge".into(),
+            tenant_id: "t".into(),
+            tool_name: "copy_workspace_sandbox_to_execution_sandbox".into(),
+            arguments_json: args.to_string(),
+            timeout_seconds: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.is_error);
+    assert!(resp.error_message.contains("host bridge"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
