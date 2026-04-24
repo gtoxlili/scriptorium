@@ -176,6 +176,13 @@ impl DockerRuntime {
     /// Streaming variant. Returns the container id (so the caller can emit a
     /// `Started` event) plus a stream that yields output chunks and a final
     /// `Finished` event.
+    ///
+    /// If the caller drops the stream before draining the final `Finished`
+    /// event, `ContainerCleanupGuard` below spawns a best-effort
+    /// kill+force-remove so the container doesn't keep running to its wall
+    /// timeout. On natural completion or explicit timeout handling the guard
+    /// is disarmed (`completed = true`) because Docker's `AutoRemove=true` or
+    /// the explicit remove call already handled cleanup.
     pub async fn exec_stream(
         &self,
         req: ExecParams,
@@ -210,6 +217,7 @@ impl DockerRuntime {
         let cid_for_stream = container_id.clone();
 
         let stream = async_stream::stream! {
+            let mut cleanup_guard = ContainerCleanupGuard::new(docker.clone(), cid_for_stream.clone());
             let mut attach_stream = attach.output;
             // Set up wait *concurrently* with attach so we capture the exit
             // code before Docker's AutoRemove races to delete the container.
@@ -253,6 +261,9 @@ impl DockerRuntime {
             }
 
             if timed_out {
+                // Explicit cleanup for the timeout path — the container would
+                // otherwise linger until the wall-clock kicks in inside it.
+                cleanup_guard.disarm();
                 let _ = docker
                     .kill_container(
                         &cid_for_stream,
@@ -270,6 +281,8 @@ impl DockerRuntime {
                 return;
             }
 
+            // Natural completion: AutoRemove handles cleanup.
+            cleanup_guard.disarm();
             let exit_code = pending_exit.unwrap_or(-1);
             let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             yield StreamEvent::Finished { exit_code, timed_out: false, duration_ms };
@@ -387,4 +400,60 @@ pub enum StreamEvent {
         timed_out: bool,
         duration_ms: u64,
     },
+}
+
+/// Drop-based cleanup for a running exec container. If the gRPC client
+/// drops `ExecStream` mid-flight, `async_stream`'s generator future is
+/// dropped — which drops this guard — which fires a best-effort
+/// `docker kill` + `force remove` so the container doesn't keep burning
+/// CPU/memory until its wall timeout.
+///
+/// Set `completed = true` (via `disarm`) when normal completion or the
+/// explicit timeout path has already handled cleanup, otherwise we'd
+/// race against Docker's own AutoRemove with no useful effect.
+struct ContainerCleanupGuard {
+    docker: Docker,
+    container_id: String,
+    disarmed: bool,
+}
+
+impl ContainerCleanupGuard {
+    fn new(docker: Docker, container_id: String) -> Self {
+        Self {
+            docker,
+            container_id,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for ContainerCleanupGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        // Can't .await in Drop — spawn the cleanup. Errors are expected if
+        // the container already exited (AutoRemove), so they're ignored.
+        let docker = self.docker.clone();
+        let cid = std::mem::take(&mut self.container_id);
+        tokio::spawn(async move {
+            tracing::debug!(container = %cid, "ExecStream dropped; cleaning up container");
+            let _ = docker
+                .kill_container(&cid, Some(KillContainerOptions { signal: "SIGKILL" }))
+                .await;
+            let _ = docker
+                .remove_container(
+                    &cid,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        });
+    }
 }
