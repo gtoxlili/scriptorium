@@ -173,8 +173,8 @@ async fn exec_echoes_to_stdout_and_stderr() {
         .unwrap()
         .into_inner();
     assert_eq!(resp.exit_code, 0);
-    assert_eq!(resp.stdout, b"hello\n");
-    assert_eq!(resp.stderr, b"world\n");
+    assert_eq!(resp.stdout.as_ref(), b"hello\n");
+    assert_eq!(resp.stderr.as_ref(), b"world\n");
     assert!(!resp.timed_out);
 }
 
@@ -248,7 +248,7 @@ async fn exec_persists_workspace_state_across_calls() {
         .unwrap()
         .into_inner();
     assert_eq!(resp.exit_code, 0);
-    assert_eq!(resp.stdout, b"persisted content\n");
+    assert_eq!(resp.stdout.as_ref(), b"persisted content\n");
 }
 
 #[tokio::test(flavor = "multi_thread")]
