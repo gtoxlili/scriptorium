@@ -320,22 +320,33 @@ receives {url: \"https://...\", size_bytes: 245_760, ...} → reply to \
 the user with just the URL.";
 
 const COPY_WORKSPACE_SANDBOX_TO_EXECUTION_SANDBOX_DESCRIPTION: &str = "\
-Copy a file or directory from the brand workspace `sandbox/` exchange \
-folder into the execution sandbox workspace. Use this when a prior \
-workspace tool created or edited inputs under `sandbox/...` and shell work \
-now needs them inside $HOME.
+Copy a file or directory from the brand workspace into the execution \
+sandbox workspace. Use this when shell work in $HOME needs access to a \
+file the AI has in the workspace — a file_extract spill, a memory doc, \
+a staged sandbox input, a presentation deck's HTML source, etc.
 
 Rules
 ─────
-- `source_path` MUST point to `sandbox/...` inside the brand workspace. \
-`extracts/...` is not valid here and stays read-only.
-- Files are copied as-is to `target_path` inside the execution sandbox.
+- `source_path` is any workspace path the AI can read: \
+`sandbox/...` (staged inputs the AI wrote), \
+`extracts/...` (file_extract spills), \
+`memory/...` (brand memory documents), \
+`presentations/<deck_id>/index.html` (deck sources), and so on. The \
+file is streamed into the sandbox as-is; the workspace copy is not \
+modified.
+- `target_path` lands inside the execution sandbox at `$HOME/<target_path>`.
+- Files are copied as-is to `target_path`.
 - Directories are packaged as tar.gz, transferred, then extracted so \
 `target_path` becomes the copied directory root.
-- Existing targets are replaced.
+- Existing targets at `target_path` are replaced.
 
-Typical flow: write or edit `sandbox/prompt.txt` with the host's \
-workspace tools → copy_workspace_sandbox_to_execution_sandbox(\
+Typical flows:
+- file_extract spilled a large doc into `extracts/<ts>-xxx.md` → \
+copy_workspace_sandbox_to_execution_sandbox(\
+source_path=\"extracts/<ts>-xxx.md\", target_path=\"inputs/novel.md\") → \
+execute_shell reads $HOME/inputs/novel.md.
+- AI staged a prompt at `sandbox/prompt.txt` via workspace tools → \
+copy_workspace_sandbox_to_execution_sandbox(\
 source_path=\"sandbox/prompt.txt\", target_path=\"inputs/prompt.txt\") → \
 execute_shell reads $HOME/inputs/prompt.txt.";
 
@@ -515,10 +526,16 @@ mod tests {
         );
 
         let push = by_name(TOOL_COPY_WORKSPACE_SANDBOX_TO_EXECUTION_SANDBOX);
-        assert!(
-            push.contains("sandbox/..."),
-            "workspace->execution bridge must constrain source_path"
-        );
+        // Description must enumerate the zones the AI can pull from so the
+        // model knows it's not limited to sandbox/ stage files — the whole
+        // point of this bridge is pushing file_extract spills (extracts/),
+        // brand memory docs, and deck HTML into $HOME for shell work.
+        for required in ["sandbox/", "extracts/", "memory/", "target_path"] {
+            assert!(
+                push.contains(required),
+                "workspace->execution bridge description missing {required:?}"
+            );
+        }
 
         let pull = by_name(TOOL_COPY_EXECUTION_SANDBOX_TO_WORKSPACE_SANDBOX);
         assert!(
