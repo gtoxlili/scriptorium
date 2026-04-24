@@ -36,7 +36,33 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_LINK_MODE=copy \
     # Let uv use the system Python instead of downloading its own — the
     # image already ships with Debian's python3.
-    UV_PYTHON_PREFERENCE=system
+    UV_PYTHON_PREFERENCE=system \
+    # ─── China-local mirrors (build-time only; agents at runtime can \
+    # still hit any public registry via outbound network). Chosen for \
+    # reliability from the Shanghai region: TUNA for PyPI + Debian, \
+    # npmmirror for npm + Node + Playwright, ghproxy for GitHub \
+    # releases.
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    NPM_CONFIG_REGISTRY=https://registry.npmmirror.com
+    # Note: intentionally NOT setting PLAYWRIGHT_DOWNLOAD_HOST. npmmirror's
+    # Playwright binary mirror lags upstream by multiple builds, so pinning
+    # to it breaks whenever `pip install playwright` pulls a version newer
+    # than the mirror has synced. The official Microsoft CDN is fast enough
+    # through any standard outbound proxy / direct connection.
+
+# --- Debian apt mirror (TUNA) ---------------------------------------------
+# Debian 13 (trixie) ships sources as deb822 under /etc/apt/sources.list.d/.
+# Rewrite deb.debian.org/{debian,debian-security} to TUNA over plain HTTP
+# — apt metadata is GPG-signed, so the transport doesn't need TLS and we
+# sidestep any TLS-termination quirks on the local network path. This
+# must come before the first `apt-get update` so every subsequent install
+# benefits.
+RUN sed -i \
+      -e 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' \
+      -e 's|http://security.debian.org/debian-security|http://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+      /etc/apt/sources.list.d/debian.sources
 
 # --- system packages -------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -47,7 +73,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg imagemagick exiftool \
       fonts-noto-cjk fonts-noto-color-emoji \
       python3 python3-venv \
-      gnupg build-essential \
+      gnupg build-essential xz-utils \
  && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
  && sed -i 's/# *\(zh_CN.UTF-8\)/\1/' /etc/locale.gen \
  && locale-gen \
@@ -63,24 +89,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 # --- Standalone tool binaries ---------------------------------------------
-# yt-dlp: social-media / streaming video + audio downloader. Installed from
-# the upstream self-contained zipapp binary (much fresher than Debian's
-# apt package — yt-dlp cuts new releases weekly as sites change).
+# duckdb: CLI for running ad-hoc SQL over CSV / Parquet / JSON. No PyPI/npm
+# distribution for the CLI binary, only GitHub releases. We try a list of
+# known-working GitHub proxies in order; the `|| curl ...` chain falls
+# through on first success. Mirrors verified 2026-04 from a China-region
+# network — if they all go dark, swap in a fresh list.
 #
-# duckdb: CLI for running ad-hoc SQL over CSV / Parquet / JSON. Download
-# URL is arch-specific, so detect the Debian arch.
+# (yt-dlp is installed from PyPI in the Python section below, no GitHub
+# dependency needed.)
 RUN set -eux \
- && curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux \
-      -o /usr/local/bin/yt-dlp \
- && chmod +x /usr/local/bin/yt-dlp \
  && ARCH=$(dpkg --print-architecture) \
  && case "$ARCH" in \
       amd64) DUCKDB_ARCH=amd64 ;; \
       arm64) DUCKDB_ARCH=arm64 ;; \
       *) echo "unsupported arch for duckdb: $ARCH" >&2; exit 1 ;; \
     esac \
- && curl -fsSL "https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-${DUCKDB_ARCH}.zip" \
-      -o /tmp/duckdb.zip \
+ && DUCKDB_PATH="duckdb/duckdb/releases/latest/download/duckdb_cli-linux-${DUCKDB_ARCH}.zip" \
+ && { curl -fsSL --retry 2 --connect-timeout 15 \
+        "https://ghfast.top/https://github.com/${DUCKDB_PATH}" -o /tmp/duckdb.zip \
+      || curl -fsSL --retry 2 --connect-timeout 15 \
+           "https://gh-proxy.com/https://github.com/${DUCKDB_PATH}" -o /tmp/duckdb.zip \
+      || curl -fsSL --retry 2 --connect-timeout 15 \
+           "https://gh.ddlc.top/https://github.com/${DUCKDB_PATH}" -o /tmp/duckdb.zip \
+      || { echo "all GitHub proxies failed for duckdb" >&2; exit 1; }; } \
  && unzip /tmp/duckdb.zip -d /usr/local/bin/ \
  && chmod +x /usr/local/bin/duckdb \
  && rm /tmp/duckdb.zip
@@ -117,10 +148,34 @@ RUN mkdir -p /opt/docs \
  && curl -fsSL --retry 3 https://kuaishou.apifox.cn/llms.txt \
       -o /opt/docs/kuaishou-apifox-index.md
 
-# --- Node 24 LTS via NodeSource --------------------------------------------
-RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
- && apt-get install -y --no-install-recommends nodejs \
- && rm -rf /var/lib/apt/lists/*
+# --- Node 24 LTS via npmmirror tarball -------------------------------------
+# NodeSource's apt repo isn't mirrored in China; npmmirror is. Version
+# discovery and file download use DIFFERENT paths:
+#   - Directory listing: registry.npmmirror.com/-/binary/node/ serves a
+#     JSON index (the cdn path 404s on OSS list-bucket). We pick the
+#     latest v24.x patch release so the image doesn't go stale.
+#   - Actual tarball: cdn.npmmirror.com/binaries/node/vX.Y.Z/…tar.xz
+#     is the direct-200 endpoint (the `/mirrors/node/` and
+#     `/-/binary/node/` paths both 302 back to here, so we skip the hop).
+RUN set -eux \
+ && ARCH=$(dpkg --print-architecture) \
+ && case "$ARCH" in \
+      amd64) NODE_ARCH=x64 ;; \
+      arm64) NODE_ARCH=arm64 ;; \
+      *) echo "unsupported arch for node: $ARCH" >&2; exit 1 ;; \
+    esac \
+ && NODE_VERSION=$(curl -fsSL --retry 3 --connect-timeout 30 \
+      https://registry.npmmirror.com/-/binary/node/ \
+      | jq -r '.[] | select(.name | startswith("v24.")) | .name' \
+      | tr -d '/' | sort -V | tail -1) \
+ && [ -n "$NODE_VERSION" ] || { echo "failed to resolve latest Node v24 from npmmirror" >&2; exit 1; } \
+ && echo "installing Node ${NODE_VERSION} (${NODE_ARCH})" \
+ && curl -fsSL --retry 3 --connect-timeout 30 \
+      "https://cdn.npmmirror.com/binaries/node/${NODE_VERSION}/node-${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
+      -o /tmp/node.tar.xz \
+ && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \
+ && rm /tmp/node.tar.xz \
+ && node --version && npm --version
 
 # --- Python packages (global baseline) -------------------------------------
 # Installed via `uv pip install --system` into /usr/lib/python3/dist-packages
@@ -137,7 +192,8 @@ RUN uv pip install --system --break-system-packages --no-cache \
       openpyxl \
       weasyprint \
       playwright \
-      jinja2 pyyaml tiktoken
+      jinja2 pyyaml tiktoken \
+      yt-dlp
 
 # Install Chromium via Playwright so the browser lives at
 # $PLAYWRIGHT_BROWSERS_PATH (/opt/ms-playwright), not in the bind-mounted

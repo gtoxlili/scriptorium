@@ -9,7 +9,7 @@ listen = "127.0.0.1:50051"
 # process itself (not necessarily the host).
 #
 #   Native run (launchd / cargo run) on macOS with OrbStack:
-#       socket = "/Users/influo/.orbstack/run/docker.sock"
+#       socket = "$HOME/.orbstack/run/docker.sock"
 #   Native run with Docker Desktop:
 #       socket = "/var/run/docker.sock"
 #   Inside a container via docker-compose.yml:

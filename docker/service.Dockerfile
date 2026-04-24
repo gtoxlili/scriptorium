@@ -14,8 +14,34 @@
 #   docker compose up -d --build
 
 # ─── Builder ───────────────────────────────────────────────────────────
-FROM rust:1-slim-bookworm AS builder
+# rust:slim = latest stable Rust on the current Debian slim base. Unpinned
+# so the image tracks upstream toolchain updates automatically — cargo.lock
+# and rust-toolchain.toml still pin the actual compiler used for the build.
+FROM rust:slim AS builder
 WORKDIR /src
+
+# ─── Build-time mirrors ──────────────────────────────────────────────────
+# Pin Debian apt to TUNA and crates.io to USTC. apt metadata is GPG-signed
+# and cargo validates every crate by checksum, so serving both over plain
+# HTTP is safe and sidesteps any TLS-termination quirks from the local
+# network path.
+RUN find /etc/apt -maxdepth 2 -type f \
+        \( -name '*.list' -o -name '*.sources' \) -exec sed -i \
+        -e 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' \
+        -e 's|https://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' \
+        -e 's|http://security.debian.org/debian-security|http://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+        -e 's|https://security.debian.org/debian-security|http://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+        {} + \
+ && printf '%s\n' \
+      '[source.crates-io]' \
+      'replace-with = "ustc"' \
+      '' \
+      '[source.ustc]' \
+      'registry = "sparse+http://mirrors.ustc.edu.cn/crates.io-index/"' \
+      '' \
+      '[net]' \
+      'retry = 10' \
+      > "${CARGO_HOME:-/usr/local/cargo}/config.toml"
 
 # aws-lc-rs (used via rustls under aws-sdk-s3) compiles C; tonic-build
 # needs protoc. build-essential + cmake cover the native toolchain,
@@ -39,7 +65,19 @@ ENV RUSTFLAGS="-C target-cpu=native"
 RUN cargo build --release --locked --bin scriptorium
 
 # ─── Runtime ───────────────────────────────────────────────────────────
-FROM debian:12-slim
+# debian:stable-slim follows whichever Debian release is currently stable
+# (bookworm → trixie → …). apt-source rewriting below handles both the
+# legacy sources.list format and the deb822 debian.sources format.
+FROM debian:stable-slim
+
+# Same Debian apt mirror as the builder stage.
+RUN find /etc/apt -maxdepth 2 -type f \
+        \( -name '*.list' -o -name '*.sources' \) -exec sed -i \
+        -e 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' \
+        -e 's|https://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' \
+        -e 's|http://security.debian.org/debian-security|http://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+        -e 's|https://security.debian.org/debian-security|http://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+        {} +
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
