@@ -21,10 +21,13 @@ control_timeout_seconds = 60
 # Image tag is pinned by convention. Build it from docker/sandbox.Dockerfile.
 default_image = "scriptorium-sandbox:debian13-v1"
 default_timeout_seconds = 300
-default_cpu_millis = 4000                        # 4 cores
-default_memory_bytes = 8589934592                # 8 GiB
-default_pids = 512
-default_tmpfs_bytes = 2147483648                 # 2 GiB
+# Defaults sized for typical agent workloads (scripts, light browser
+# automation, small data processing). Heavy one-offs override via
+# ExecRequest.limits. Raise these if your host has RAM to spare.
+default_cpu_millis = 2000                        # 2 cores
+default_memory_bytes = 2147483648                # 2 GiB
+default_pids = 256
+default_tmpfs_bytes = 1073741824                 # 1 GiB (kept ≤ memory cap)
 agent_uid = 1000
 agent_gid = 1000
 workspace_mount = "/home/agent"
@@ -56,8 +59,14 @@ upload_timeout_seconds     = 300
 [concurrency]
 # Hard cap on simultaneously running exec containers. Requests beyond this
 # queue for at most `exec_queue_timeout_seconds` then return
-# RESOURCE_EXHAUSTED. 0 on either field uses server defaults (4 / 30 s).
-max_concurrent_execs       = 4
+# RESOURCE_EXHAUSTED. 0 on either field uses server defaults (10 / 30 s).
+#
+# Size this so `max_concurrent_execs * sandbox.default_memory_bytes` lines
+# up with your Docker daemon's VM memory minus what your other containers
+# use. Default 10 × 2 GiB = 20 GiB caps is comfortable on a ~20 GiB VM:
+# cgroup memory accounting is lazy, and typical agent execs actually use
+# a small fraction of their cap.
+max_concurrent_execs       = 10
 exec_queue_timeout_seconds = 30
 
 [fetch]

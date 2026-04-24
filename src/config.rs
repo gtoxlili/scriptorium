@@ -75,16 +75,16 @@ fn default_exec_timeout() -> u32 {
     300
 }
 fn default_cpu_millis() -> u32 {
-    4000
+    2000
 }
 fn default_memory_bytes() -> u64 {
-    8 * 1024 * 1024 * 1024
+    2 * 1024 * 1024 * 1024
 }
 fn default_pids() -> u32 {
-    512
+    256
 }
 fn default_tmpfs_bytes() -> u64 {
-    2 * 1024 * 1024 * 1024
+    1024 * 1024 * 1024
 }
 fn default_agent_uid() -> u32 {
     1000
@@ -160,7 +160,7 @@ fn default_upload_timeout() -> u64 {
 pub struct ConcurrencyConfig {
     /// Hard cap on simultaneously running containers spawned by `Exec` and
     /// `ExecStream`. Requests beyond this queue (up to `queue_timeout`).
-    /// 0 = derive a default from available CPU/memory (currently: 4).
+    /// 0 = derive a default from available CPU/memory (currently: 10).
     #[serde(default)]
     pub max_concurrent_execs: u32,
     /// Time a queued exec will wait for a permit before returning
@@ -172,7 +172,7 @@ pub struct ConcurrencyConfig {
 impl ConcurrencyConfig {
     pub fn effective_max(&self) -> usize {
         if self.max_concurrent_execs == 0 {
-            4
+            10
         } else {
             self.max_concurrent_execs as usize
         }
