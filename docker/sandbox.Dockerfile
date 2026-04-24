@@ -85,6 +85,19 @@ RUN set -eux \
  && chmod +x /usr/local/bin/duckdb \
  && rm /tmp/duckdb.zip
 
+# --- Bundled documentation indexes ----------------------------------------
+# Plain-markdown API-doc indexes that the agent can grep offline to
+# discover which endpoints exist; linked sub-pages are still fetched live
+# (outbound network is open). Living under /opt/docs keeps them out of
+# $HOME so the bind-mount does not shadow them at runtime.
+#
+# - Feishu (Lark) OpenAPI — published as llms.txt by Apifox; ~400 endpoint
+#   + schema doc URLs. Use when building any Feishu integration
+#   (messaging, docs, bitable, sheets, calendar, approvals, events, …).
+RUN mkdir -p /opt/docs \
+ && curl -fsSL --retry 3 https://feishu.apifox.cn/llms.txt \
+      -o /opt/docs/feishu-apifox-index.md
+
 # --- Node 24 LTS via NodeSource --------------------------------------------
 RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \

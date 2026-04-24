@@ -136,6 +136,15 @@ covering YouTube, Bilibili, Douyin/TikTok, Xiaohongshu, and most \
 streaming sites; prefer over hand-rolled scraping), `duckdb` (SQL CLI \
 for ad-hoc querying of CSV / Parquet / JSON — `duckdb -c \"SELECT ... \
 FROM read_csv_auto('file.csv')\"`).
+- Bundled doc indexes under `/opt/docs/`:
+  - `/opt/docs/feishu-apifox-index.md` — Feishu (Lark) OpenAPI: \
+    plain-markdown list of ~400 endpoint / schema doc URLs. Grep it for \
+    the API you want (`rg '消息\\|message\\|bitable\\|approval' \
+    /opt/docs/feishu-apifox-index.md`), then `curl -fsSL <matched url>` \
+    to fetch the full endpoint doc. Use this whenever you build a \
+    Feishu / Lark integration (messaging, docs, bitable, sheets, \
+    calendar, approvals, workspace events, …) — it is faster and more \
+    reliable than web-searching for the API.
 - `build-essential` (gcc, g++, make) is present so uv can compile \
 C-extension wheels on the fly.
 - Prefer `rg` over `grep -r` and `fd` over `find`: they are an order of \
