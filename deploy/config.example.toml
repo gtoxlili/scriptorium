@@ -28,6 +28,14 @@ default_cpu_millis = 2000                        # 2 cores
 default_memory_bytes = 2147483648                # 2 GiB
 default_pids = 256
 default_tmpfs_bytes = 1073741824                 # 1 GiB (kept ≤ memory cap)
+# Heavy tier — kicks in when execute_shell is called with `heavy = true`.
+# The LLM is expected to flag genuinely heavier work (Chromium with many
+# tabs, large pandas, video encoding). One heavy exec ≈ 4 light ones;
+# sizing is a deliberate step up from the default tier.
+heavy_cpu_millis = 4000                          # 4 cores
+heavy_memory_bytes = 8589934592                  # 8 GiB
+heavy_pids = 512
+heavy_tmpfs_bytes = 2147483648                   # 2 GiB
 agent_uid = 1000
 agent_gid = 1000
 workspace_mount = "/home/agent"

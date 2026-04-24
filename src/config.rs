@@ -59,6 +59,21 @@ pub struct SandboxConfig {
     /// Default /tmp tmpfs size in bytes.
     #[serde(default = "default_tmpfs_bytes")]
     pub default_tmpfs_bytes: u64,
+    /// Heavy-mode CPU quota. Used when `execute_shell` is invoked with
+    /// `heavy = true`, i.e. the LLM has flagged this specific call as
+    /// needing more than the default budget (Chromium with many tabs,
+    /// large pandas, video encoding, …). Meant to be ≥ default_cpu_millis.
+    #[serde(default = "default_heavy_cpu_millis")]
+    pub heavy_cpu_millis: u32,
+    /// Heavy-mode memory cap (bytes). See `heavy_cpu_millis`.
+    #[serde(default = "default_heavy_memory_bytes")]
+    pub heavy_memory_bytes: u64,
+    /// Heavy-mode PID limit.
+    #[serde(default = "default_heavy_pids")]
+    pub heavy_pids: u32,
+    /// Heavy-mode /tmp tmpfs size.
+    #[serde(default = "default_heavy_tmpfs_bytes")]
+    pub heavy_tmpfs_bytes: u64,
     /// UID that the in-container non-root user has. The workspace directory
     /// is chowned to this uid on first access so bind-mount writes land with
     /// the correct ownership.
@@ -85,6 +100,18 @@ fn default_pids() -> u32 {
 }
 fn default_tmpfs_bytes() -> u64 {
     1024 * 1024 * 1024
+}
+fn default_heavy_cpu_millis() -> u32 {
+    4000
+}
+fn default_heavy_memory_bytes() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+fn default_heavy_pids() -> u32 {
+    512
+}
+fn default_heavy_tmpfs_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
 }
 fn default_agent_uid() -> u32 {
     1000

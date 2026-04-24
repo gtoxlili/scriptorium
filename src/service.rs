@@ -733,6 +733,20 @@ impl Sandbox for SandboxService {
                 } else {
                     args.timeout_seconds
                 };
+                // `heavy` opts this one call into the fatter resource tier
+                // from sandbox config. Light calls (default) get `limits =
+                // None`, which picks up the server defaults.
+                let limits = if args.heavy {
+                    let sbx = self.runtime.sandbox_cfg();
+                    Some(ResourceLimits {
+                        cpu_millis: sbx.heavy_cpu_millis,
+                        memory_bytes: sbx.heavy_memory_bytes,
+                        pids: sbx.heavy_pids,
+                        tmpfs_bytes: sbx.heavy_tmpfs_bytes,
+                    })
+                } else {
+                    None
+                };
                 let exec_req = ExecRequest {
                     workspace_id: inner.workspace_id.clone(),
                     tenant_id: inner.tenant_id.clone(),
@@ -740,7 +754,7 @@ impl Sandbox for SandboxService {
                     timeout_seconds,
                     env: args.env,
                     image: String::new(),
-                    limits: None,
+                    limits,
                 };
                 let resp = self.do_exec_oneshot(exec_req).await?;
                 let result = tools::ExecuteShellResult {

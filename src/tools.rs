@@ -57,6 +57,12 @@ pub struct ExecuteShellArgs {
     pub timeout_seconds: u32,
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// Opt in to the heavy resource tier for this one call (Chromium
+    /// with many tabs, pandas on large data, video encoding). Raises
+    /// the per-exec caps to `sandbox.heavy_*` from config. Default
+    /// `false`: typical scripts should not set this.
+    #[serde(default)]
+    pub heavy: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -374,6 +380,10 @@ const EXECUTE_SHELL_SCHEMA: &str = r#"{
       "type": "object",
       "additionalProperties": { "type": "string" },
       "description": "Extra environment variables for this call only. Layered on top of the container's base env."
+    },
+    "heavy": {
+      "type": "boolean",
+      "description": "Set true ONLY when this specific call genuinely needs more than the default 2 GiB RAM / 2 CPU cores — e.g., Chromium driving many tabs or rich pages, pandas on a >100 MB dataset, ffmpeg video encoding, large-model inference. Raises the caps to 8 GiB / 4 cores for this one call. Default false. Most calls (shell plumbing, curl, small scripts, lightweight Python) should leave this unset — the default budget is plenty and keeping it light lets other execs run in parallel."
     }
   },
   "required": ["command"]
