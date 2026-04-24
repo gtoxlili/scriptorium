@@ -125,6 +125,13 @@ pub struct TosConfig {
     /// Multipart upload chunk size. Matches aws-sdk-s3 default.
     #[serde(default = "default_part_size")]
     pub part_size_bytes: u64,
+    /// File-size threshold above which uploads switch from a single
+    /// `put_object` (reads whole file into RAM) to streaming multipart
+    /// upload (peak RAM bounded by `part_size_bytes`). Default 64 MiB —
+    /// smaller files don't gain anything from multipart's extra round
+    /// trips, larger ones benefit from bounded memory use.
+    #[serde(default = "default_multipart_threshold")]
+    pub multipart_threshold_bytes: u64,
     /// Upload total-wall timeout.
     #[serde(default = "default_upload_timeout")]
     pub upload_timeout_seconds: u64,
@@ -141,6 +148,9 @@ fn default_signed_url_max() -> u32 {
 }
 fn default_part_size() -> u64 {
     8 * 1024 * 1024
+}
+fn default_multipart_threshold() -> u64 {
+    64 * 1024 * 1024
 }
 fn default_upload_timeout() -> u64 {
     300

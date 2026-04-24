@@ -48,7 +48,9 @@ secret_key                 = "${TOS_SECRET_KEY}"
 key_prefix                 = "sandbox/"
 signed_url_expires_seconds = 3600      # 1 h default for `deliver` URLs
 signed_url_max_seconds     = 86400     # clamp hard to 24 h
-part_size_bytes            = 8388608   # 8 MiB
+part_size_bytes            = 8388608   # 8 MiB (clamped ≥5 MiB — S3's multipart minimum)
+multipart_threshold_bytes  = 67108864  # 64 MiB — files above this stream via multipart,
+                                       # below: one-shot put_object (faster for small artifacts).
 upload_timeout_seconds     = 300
 
 [concurrency]

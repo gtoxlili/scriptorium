@@ -84,6 +84,7 @@ fn tos_cfg_for_tests() -> TosConfig {
         signed_url_expires_seconds: 600,
         signed_url_max_seconds: 3600,
         part_size_bytes: 8 * 1024 * 1024,
+        multipart_threshold_bytes: 64 * 1024 * 1024,
         upload_timeout_seconds: 120,
     }
 }

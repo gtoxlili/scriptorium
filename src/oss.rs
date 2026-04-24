@@ -2,8 +2,15 @@ use std::{fmt, path::Path, time::Duration};
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
-use aws_sdk_s3::{Client, config::Region, presigning::PresigningConfig, primitives::ByteStream};
+use aws_sdk_s3::{
+    Client,
+    config::Region,
+    presigning::PresigningConfig,
+    primitives::ByteStream,
+    types::{CompletedMultipartUpload, CompletedPart},
+};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 
 use crate::{
     config::TosConfig,
@@ -21,6 +28,8 @@ pub struct OssClient {
     default_expires: Duration,
     max_expires: Duration,
     upload_timeout: Duration,
+    part_size: u64,
+    multipart_threshold: u64,
 }
 
 impl fmt::Debug for OssClient {
@@ -62,6 +71,8 @@ impl OssClient {
             default_expires: Duration::from_secs(u64::from(cfg.signed_url_expires_seconds)),
             max_expires: Duration::from_secs(u64::from(cfg.signed_url_max_seconds)),
             upload_timeout: Duration::from_secs(cfg.upload_timeout_seconds),
+            part_size: cfg.part_size_bytes.max(5 * 1024 * 1024),
+            multipart_threshold: cfg.multipart_threshold_bytes,
         })
     }
 
@@ -98,6 +109,12 @@ impl OssClient {
 
     /// Upload a file from disk to the given object key and return the
     /// sha256 + size + effective content-type.
+    ///
+    /// Small files (≤ `multipart_threshold`) take a single-shot
+    /// `put_object` — that path loads the whole body into RAM, which is
+    /// fine for a few dozen MiB. Larger files go through streaming
+    /// multipart upload so peak memory stays bounded by `part_size`
+    /// regardless of file size.
     pub async fn upload_file(
         &self,
         key: &str,
@@ -105,11 +122,40 @@ impl OssClient {
         content_type: &str,
         label: Option<&str>,
     ) -> Result<UploadOutcome> {
-        // Read full file into memory; sufficient for workspace artifacts
-        // bounded by fetch.max_body_bytes (default 1 GiB). Move to the
-        // aws-sdk transfer manager if we ever need >1 GiB uploads.
+        let size_bytes = tokio::fs::metadata(path).await?.len();
+
+        let outcome_fut = async {
+            if size_bytes > self.multipart_threshold {
+                self.upload_file_multipart(key, path, content_type, label, size_bytes)
+                    .await
+            } else {
+                self.upload_file_single(key, path, content_type, label, size_bytes)
+                    .await
+            }
+        };
+
+        tokio::time::timeout(self.upload_timeout, outcome_fut)
+            .await
+            .map_err(|_| {
+                Error::Other(format!(
+                    "upload timed out after {}s",
+                    self.upload_timeout.as_secs()
+                ))
+            })?
+    }
+
+    /// Single-shot `put_object`. Body is fully materialised in memory —
+    /// only call this for files comfortably smaller than what the host
+    /// can afford to buffer.
+    async fn upload_file_single(
+        &self,
+        key: &str,
+        path: &Path,
+        content_type: &str,
+        label: Option<&str>,
+        size_bytes: u64,
+    ) -> Result<UploadOutcome> {
         let data = tokio::fs::read(path).await?;
-        let size_bytes = data.len() as u64;
         let mut hasher = Sha256::new();
         hasher.update(&data);
         let sha256_hex = hex::encode(hasher.finalize());
@@ -125,15 +171,8 @@ impl OssClient {
         if let Some(l) = label {
             put = put.metadata("label", l);
         }
-
-        tokio::time::timeout(self.upload_timeout, put.send())
+        put.send()
             .await
-            .map_err(|_| {
-                Error::Other(format!(
-                    "upload timed out after {}s",
-                    self.upload_timeout.as_secs()
-                ))
-            })?
             .map_err(|e| Error::Other(format!("put_object: {e}")))?;
 
         Ok(UploadOutcome {
@@ -142,6 +181,163 @@ impl OssClient {
             content_type: content_type.to_string(),
             sha256_hex,
         })
+    }
+
+    /// Multipart upload. Reads `path` sequentially in `part_size` chunks
+    /// (never more than one part in memory at a time), hashes as it goes
+    /// so the final sha256 matches what TOS stored, and aborts the
+    /// in-progress upload on any error to avoid stranding parts that
+    /// would otherwise be billed as incomplete storage.
+    async fn upload_file_multipart(
+        &self,
+        key: &str,
+        path: &Path,
+        content_type: &str,
+        label: Option<&str>,
+        size_bytes: u64,
+    ) -> Result<UploadOutcome> {
+        // 1. Open the multipart upload.
+        let mut create = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .content_type(content_type);
+        if let Some(l) = label {
+            create = create.metadata("label", l);
+        }
+        let created = create
+            .send()
+            .await
+            .map_err(|e| Error::Other(format!("create_multipart_upload: {e}")))?;
+        let upload_id = created
+            .upload_id()
+            .ok_or_else(|| Error::Other("create_multipart_upload: missing upload_id".into()))?
+            .to_string();
+
+        // 2. Stream parts. Wrap the whole loop so that on ANY error we can
+        //    abort the upload before bubbling up.
+        let part_size = usize::try_from(self.part_size).unwrap_or(usize::MAX);
+        let upload_result = self
+            .stream_parts(key, path, &upload_id, part_size)
+            .await;
+
+        let (completed_parts, sha256_hex) = match upload_result {
+            Ok(v) => v,
+            Err(e) => {
+                // Best-effort abort; ignore the response because we're
+                // already returning the original error.
+                let _ = self
+                    .client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .send()
+                    .await;
+                return Err(e);
+            }
+        };
+
+        // 3. Finalise. S3 requires parts sorted by part_number — we emit
+        //    them sequentially so they're already in order.
+        let completed = CompletedMultipartUpload::builder()
+            .set_parts(Some(completed_parts))
+            .build();
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(completed)
+            .send()
+            .await
+            .map_err(|e| {
+                // Complete can fail after all parts uploaded OK (e.g. network
+                // blip on the final RPC). Abort to keep the bucket tidy.
+                let client = self.client.clone();
+                let bucket = self.bucket.clone();
+                let key = key.to_string();
+                let upload_id = upload_id.clone();
+                tokio::spawn(async move {
+                    let _ = client
+                        .abort_multipart_upload()
+                        .bucket(bucket)
+                        .key(key)
+                        .upload_id(upload_id)
+                        .send()
+                        .await;
+                });
+                Error::Other(format!("complete_multipart_upload: {e}"))
+            })?;
+
+        Ok(UploadOutcome {
+            key: key.to_string(),
+            size_bytes,
+            content_type: content_type.to_string(),
+            sha256_hex,
+        })
+    }
+
+    async fn stream_parts(
+        &self,
+        key: &str,
+        path: &Path,
+        upload_id: &str,
+        part_size: usize,
+    ) -> Result<(Vec<CompletedPart>, String)> {
+        let mut file = tokio::fs::File::open(path).await?;
+        let mut hasher = Sha256::new();
+        let mut completed_parts: Vec<CompletedPart> = Vec::new();
+        let mut part_number: i32 = 1;
+        let mut buf = vec![0u8; part_size];
+
+        loop {
+            // Fill the buffer (may span multiple `read` calls for large
+            // parts on slow filesystems).
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                let n = file.read(&mut buf[filled..]).await?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            if filled == 0 {
+                // Exactly at EOF on a part boundary — part_number-1 was
+                // the last part, nothing more to send.
+                break;
+            }
+
+            let chunk = buf[..filled].to_vec();
+            hasher.update(&chunk);
+
+            let part = self
+                .client
+                .upload_part()
+                .bucket(&self.bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(chunk))
+                .send()
+                .await
+                .map_err(|e| Error::Other(format!("upload_part({part_number}): {e}")))?;
+
+            completed_parts.push(
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .set_e_tag(part.e_tag().map(String::from))
+                    .build(),
+            );
+
+            part_number += 1;
+            if filled < buf.len() {
+                break; // Short read = last part, no need for another iteration.
+            }
+        }
+
+        Ok((completed_parts, hex::encode(hasher.finalize())))
     }
 
     /// Presign a GET URL for the given key.
