@@ -8,11 +8,12 @@ use std::{
 
 use bollard::{
     Docker,
-    container::{
-        AttachContainerOptions, Config, CreateContainerOptions, KillContainerOptions, LogOutput,
-        RemoveContainerOptions, WaitContainerOptions,
+    container::LogOutput,
+    models::{ContainerCreateBody, HostConfig},
+    query_parameters::{
+        AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, KillContainerOptionsBuilder,
+        RemoveContainerOptionsBuilder, StartContainerOptions, WaitContainerOptions,
     },
-    models::HostConfig,
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -88,21 +89,22 @@ impl DockerRuntime {
         // Attach BEFORE start so we don't miss early output.
         let attach = self
             .docker
-            .attach_container::<String>(
+            .attach_container(
                 &container_id,
-                Some(AttachContainerOptions {
-                    stdout: Some(true),
-                    stderr: Some(true),
-                    stream: Some(true),
-                    logs: Some(false),
-                    stdin: Some(false),
-                    detach_keys: None,
-                }),
+                Some(
+                    AttachContainerOptionsBuilder::default()
+                        .stdout(true)
+                        .stderr(true)
+                        .stream(true)
+                        .logs(false)
+                        .stdin(false)
+                        .build(),
+                ),
             )
             .await?;
 
         self.docker
-            .start_container::<String>(&container_id, None)
+            .start_container(&container_id, None::<StartContainerOptions>)
             .await?;
 
         let mut stdout = Vec::new();
@@ -124,7 +126,7 @@ impl DockerRuntime {
         };
 
         let wait = async {
-            let mut wait_stream = docker.wait_container(&cid, None::<WaitContainerOptions<String>>);
+            let mut wait_stream = docker.wait_container(&cid, None::<WaitContainerOptions>);
             // bollard maps non-zero exit codes into a dedicated error variant,
             // so we unwrap it back into the numeric code we actually want.
             match wait_stream.next().await {
@@ -147,17 +149,14 @@ impl DockerRuntime {
                 .docker
                 .kill_container(
                     &container_id,
-                    Some(KillContainerOptions { signal: "SIGKILL" }),
+                    Some(KillContainerOptionsBuilder::default().signal("SIGKILL").build()),
                 )
                 .await;
             let _ = self
                 .docker
                 .remove_container(
                     &container_id,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
+                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
                 )
                 .await;
             (-1, true)
@@ -196,21 +195,22 @@ impl DockerRuntime {
 
         let attach = self
             .docker
-            .attach_container::<String>(
+            .attach_container(
                 &container_id,
-                Some(AttachContainerOptions {
-                    stdout: Some(true),
-                    stderr: Some(true),
-                    stream: Some(true),
-                    logs: Some(false),
-                    stdin: Some(false),
-                    detach_keys: None,
-                }),
+                Some(
+                    AttachContainerOptionsBuilder::default()
+                        .stdout(true)
+                        .stderr(true)
+                        .stream(true)
+                        .logs(false)
+                        .stdin(false)
+                        .build(),
+                ),
             )
             .await?;
 
         self.docker
-            .start_container::<String>(&container_id, None)
+            .start_container(&container_id, None::<StartContainerOptions>)
             .await?;
 
         let docker = self.docker.clone();
@@ -223,7 +223,7 @@ impl DockerRuntime {
             // code before Docker's AutoRemove races to delete the container.
             let mut wait_stream = docker.wait_container(
                 &cid_for_stream,
-                None::<WaitContainerOptions<String>>,
+                None::<WaitContainerOptions>,
             );
             let deadline = tokio::time::sleep(timeout);
             tokio::pin!(deadline);
@@ -267,13 +267,13 @@ impl DockerRuntime {
                 let _ = docker
                     .kill_container(
                         &cid_for_stream,
-                        Some(KillContainerOptions { signal: "SIGKILL" }),
+                        Some(KillContainerOptionsBuilder::default().signal("SIGKILL").build()),
                     )
                     .await;
                 let _ = docker
                     .remove_container(
                         &cid_for_stream,
-                        Some(RemoveContainerOptions { force: true, ..Default::default() }),
+                        Some(RemoveContainerOptionsBuilder::default().force(true).build()),
                     )
                     .await;
                 let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -328,7 +328,7 @@ impl DockerRuntime {
         let uid = self.sandbox_cfg.agent_uid;
         let gid = self.sandbox_cfg.agent_gid;
 
-        let config = Config {
+        let config = ContainerCreateBody {
             image: Some(req.image.clone()),
             user: Some(format!("{uid}:{gid}")),
             working_dir: Some(container_path.clone()),
@@ -345,10 +345,12 @@ impl DockerRuntime {
             ..Default::default()
         };
 
-        let options = Some(CreateContainerOptions {
-            name: container_name(&req.workspace_id),
-            platform: None,
-        });
+        let name = container_name(&req.workspace_id);
+        let options = Some(
+            CreateContainerOptionsBuilder::default()
+                .name(&name)
+                .build(),
+        );
 
         let response = self.docker.create_container(options, config).await?;
         Ok(response.id)
@@ -443,15 +445,15 @@ impl Drop for ContainerCleanupGuard {
         tokio::spawn(async move {
             tracing::debug!(container = %cid, "ExecStream dropped; cleaning up container");
             let _ = docker
-                .kill_container(&cid, Some(KillContainerOptions { signal: "SIGKILL" }))
+                .kill_container(
+                    &cid,
+                    Some(KillContainerOptionsBuilder::default().signal("SIGKILL").build()),
+                )
                 .await;
             let _ = docker
                 .remove_container(
                     &cid,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
+                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
                 )
                 .await;
         });
