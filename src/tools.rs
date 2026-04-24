@@ -1,15 +1,15 @@
-//! AI-facing tool catalog.
+//! LLM-facing tool catalog.
 //!
 //! `ListTools` returns descriptors that fit the OpenAI function-call / MCP
 //! shape. `CallTool` is a thin router over the same primitives that
-//! `Exec`, `FetchIntoWorkspace`, and `UploadToOSS` expose — agent-core (or
-//! any other consumer) can skip the primitives entirely and drive the
-//! service through these tools.
+//! `Exec`, `FetchIntoWorkspace`, and `UploadToOSS` expose, so any consumer
+//! can skip the primitives entirely and drive the service through these
+//! tools instead.
 //!
-//! Descriptions below are deliberately verbose. They are the **only**
-//! context the LLM has when deciding whether/how to call a tool, so every
-//! relevant capability and limit is spelled out — implicit assumptions
-//! end up as failed tool calls and wasted turns.
+//! Descriptions below are deliberately verbose. They are the *only*
+//! context the LLM has when deciding whether and how to call a tool, so
+//! every relevant capability and limit is spelled out; implicit
+//! assumptions end up as failed tool calls and wasted turns.
 
 use serde::{Deserialize, Serialize};
 

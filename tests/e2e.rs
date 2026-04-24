@@ -451,8 +451,8 @@ async fn upload_to_oss_roundtrips_through_signed_url() {
     println!("basename:   {}", resp.basename);
     println!("sha256:     {}", resp.sha256_hex);
 
-    // 3. To simulate what agent-core does at download time — re-sign with
-    //    the configured OSS client and fetch. Proves the object landed
+    // 3. Simulate what a host attachment layer does at download time: re-sign
+    //    with the configured OSS client and fetch. Proves the object landed
     //    correctly and is retrievable from a private-read bucket.
     let oss = OssClient::connect(&tos_cfg_for_tests()).expect("oss connect for signing");
     let signed_url = oss
