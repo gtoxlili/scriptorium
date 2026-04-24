@@ -21,10 +21,10 @@ FROM rust:slim AS builder
 WORKDIR /src
 
 # ─── Build-time mirrors ──────────────────────────────────────────────────
-# Pin Debian apt to TUNA and crates.io to USTC. apt metadata is GPG-signed
-# and cargo validates every crate by checksum, so serving both over plain
-# HTTP is safe and sidesteps any TLS-termination quirks from the local
-# network path.
+# Pin Debian apt to TUNA and crates.io to rsproxy.cn (Rust 中国社区镜像,
+# 比 USTC 稳定,很少 30s 超时). apt metadata is GPG-signed and cargo
+# validates every crate by checksum, so the integrity guarantees are
+# unchanged regardless of mirror.
 RUN find /etc/apt -maxdepth 2 -type f \
         \( -name '*.list' -o -name '*.sources' \) -exec sed -i \
         -e 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' \
@@ -34,13 +34,21 @@ RUN find /etc/apt -maxdepth 2 -type f \
         {} + \
  && printf '%s\n' \
       '[source.crates-io]' \
-      'replace-with = "ustc"' \
+      'replace-with = "rsproxy-sparse"' \
       '' \
-      '[source.ustc]' \
-      'registry = "sparse+http://mirrors.ustc.edu.cn/crates.io-index/"' \
+      '[source.rsproxy-sparse]' \
+      'registry = "sparse+https://rsproxy.cn/index/"' \
+      '' \
+      '[registries.rsproxy]' \
+      'index = "https://rsproxy.cn/crates.io-index"' \
       '' \
       '[net]' \
+      'git-fetch-with-cli = true' \
       'retry = 10' \
+      '' \
+      '[http]' \
+      'timeout = 120' \
+      'multiplexing = false' \
       > "${CARGO_HOME:-/usr/local/cargo}/config.toml"
 
 # aws-lc-rs (used via rustls under aws-sdk-s3) compiles C; tonic-build
@@ -62,7 +70,17 @@ COPY src ./src
 # Linux binary picks them up automatically. If you rebuild on a different
 # host (Graviton, Ampere, etc.), the image gets tuned for that host's CPU.
 ENV RUSTFLAGS="-C target-cpu=native"
-RUN cargo build --release --locked --bin scriptorium
+
+# BuildKit cache mounts persist cargo registry / git / target across
+# builds — failed/retried builds keep whatever crates already downloaded,
+# and a clean `docker build` after a code-only edit finishes in seconds.
+# target/ must be copied out because the cache mount is not part of the
+# image layer.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked --bin scriptorium \
+ && cp target/release/scriptorium /scriptorium
 
 # ─── Runtime ───────────────────────────────────────────────────────────
 # debian:stable-slim follows whichever Debian release is currently stable
@@ -84,7 +102,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       tini \
  && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /src/target/release/scriptorium /usr/local/bin/scriptorium
+COPY --from=builder /scriptorium /usr/local/bin/scriptorium
 
 EXPOSE 50051
 
