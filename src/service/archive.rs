@@ -12,10 +12,7 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
-use tokio::{
-    fs,
-    io::AsyncReadExt,
-};
+use tokio::{fs, io::AsyncReadExt};
 
 use crate::error::{Error, Result};
 
@@ -75,13 +72,12 @@ pub(super) async fn replace_workspace_directory_from_archive_path(
 ) -> Result<()> {
     let target_parent = target
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     fs::create_dir_all(&target_parent).await?;
     let extraction_root = build_workspace_transfer_temp_path(&target, "expand");
     let target_clone = target.clone();
     tokio::task::spawn_blocking(move || {
-        extract_archive_and_replace(staging, extraction_root, target_clone)
+        extract_archive_and_replace(&staging, &extraction_root, &target_clone)
     })
     .await
     .map_err(|e| Error::Other(format!("extract archive join: {e}")))??;
@@ -103,16 +99,16 @@ pub(super) async fn sha256_file(path: &Path) -> Result<String> {
 }
 
 fn extract_archive_and_replace(
-    staging: PathBuf,
-    extraction_root: PathBuf,
-    target: PathBuf,
+    staging: &Path,
+    extraction_root: &Path,
+    target: &Path,
 ) -> Result<()> {
     if extraction_root.exists() {
-        std::fs::remove_dir_all(&extraction_root)?;
+        std::fs::remove_dir_all(extraction_root)?;
     }
-    std::fs::create_dir_all(&extraction_root)?;
+    std::fs::create_dir_all(extraction_root)?;
 
-    let file = std::fs::File::open(&staging)?;
+    let file = std::fs::File::open(staging)?;
     let gz = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);
     archive.set_overwrite(true);
@@ -140,30 +136,30 @@ fn extract_archive_and_replace(
                 )));
             }
         }
-        entry.unpack_in(&extraction_root)?;
+        entry.unpack_in(extraction_root)?;
     }
 
-    remove_path_if_exists_blocking(&target)?;
+    remove_path_if_exists_blocking(target)?;
 
     let mut entries =
-        std::fs::read_dir(&extraction_root)?.collect::<std::result::Result<Vec<_>, _>>()?;
+        std::fs::read_dir(extraction_root)?.collect::<std::result::Result<Vec<_>, _>>()?;
     if entries.len() == 1 {
         let source = entries.remove(0).path();
         if source.is_dir() {
-            std::fs::rename(source, &target)?;
-            let _ = std::fs::remove_dir_all(&extraction_root);
-            let _ = std::fs::remove_file(&staging);
+            std::fs::rename(source, target)?;
+            let _ = std::fs::remove_dir_all(extraction_root);
+            let _ = std::fs::remove_file(staging);
             return Ok(());
         }
     }
 
-    std::fs::create_dir_all(&target)?;
-    for entry in std::fs::read_dir(&extraction_root)? {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(extraction_root)? {
         let entry = entry?;
         std::fs::rename(entry.path(), target.join(entry.file_name()))?;
     }
-    let _ = std::fs::remove_dir_all(&extraction_root);
-    let _ = std::fs::remove_file(&staging);
+    let _ = std::fs::remove_dir_all(extraction_root);
+    let _ = std::fs::remove_file(staging);
     Ok(())
 }
 

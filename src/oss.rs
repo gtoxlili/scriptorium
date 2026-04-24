@@ -218,9 +218,7 @@ impl OssClient {
         // 2. Stream parts. Wrap the whole loop so that on ANY error we can
         //    abort the upload before bubbling up.
         let part_size = usize::try_from(self.part_size).unwrap_or(usize::MAX);
-        let upload_result = self
-            .stream_parts(key, path, &upload_id, part_size)
-            .await;
+        let upload_result = self.stream_parts(key, path, &upload_id, part_size).await;
 
         let (completed_parts, sha256_hex) = match upload_result {
             Ok(v) => v,

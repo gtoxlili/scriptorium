@@ -149,7 +149,11 @@ impl DockerRuntime {
                 .docker
                 .kill_container(
                     &container_id,
-                    Some(KillContainerOptionsBuilder::default().signal("SIGKILL").build()),
+                    Some(
+                        KillContainerOptionsBuilder::default()
+                            .signal("SIGKILL")
+                            .build(),
+                    ),
                 )
                 .await;
             let _ = self
@@ -346,11 +350,7 @@ impl DockerRuntime {
         };
 
         let name = container_name(&req.workspace_id);
-        let options = Some(
-            CreateContainerOptionsBuilder::default()
-                .name(&name)
-                .build(),
-        );
+        let options = Some(CreateContainerOptionsBuilder::default().name(&name).build());
 
         let response = self.docker.create_container(options, config).await?;
         Ok(response.id)
@@ -447,7 +447,11 @@ impl Drop for ContainerCleanupGuard {
             let _ = docker
                 .kill_container(
                     &cid,
-                    Some(KillContainerOptionsBuilder::default().signal("SIGKILL").build()),
+                    Some(
+                        KillContainerOptionsBuilder::default()
+                            .signal("SIGKILL")
+                            .build(),
+                    ),
                 )
                 .await;
             let _ = docker

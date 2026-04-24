@@ -35,10 +35,10 @@ use tonic::transport::{Channel, Server};
 
 /// OrbStack default socket on macOS. Override with `DOCKER_HOST=unix:///path`.
 fn discover_docker_socket() -> PathBuf {
-    if let Ok(host) = std::env::var("DOCKER_HOST") {
-        if let Some(path) = host.strip_prefix("unix://") {
-            return PathBuf::from(path);
-        }
+    if let Ok(host) = std::env::var("DOCKER_HOST")
+        && let Some(path) = host.strip_prefix("unix://")
+    {
+        return PathBuf::from(path);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     PathBuf::from(format!("{home}/.orbstack/run/docker.sock"))
@@ -460,7 +460,7 @@ async fn upload_to_oss_roundtrips_through_signed_url() {
     //    correctly and is retrievable from a private-read bucket.
     let oss = OssClient::connect(&tos_cfg_for_tests()).expect("oss connect for signing");
     let signed_url = oss
-        .signed_url(&resp.object_key, std::time::Duration::from_secs(120))
+        .signed_url(&resp.object_key, std::time::Duration::from_mins(2))
         .await
         .expect("signed url");
     let body = reqwest::Client::new()
