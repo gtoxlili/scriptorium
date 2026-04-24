@@ -136,15 +136,24 @@ covering YouTube, Bilibili, Douyin/TikTok, Xiaohongshu, and most \
 streaming sites; prefer over hand-rolled scraping), `duckdb` (SQL CLI \
 for ad-hoc querying of CSV / Parquet / JSON — `duckdb -c \"SELECT ... \
 FROM read_csv_auto('file.csv')\"`).
-- Bundled doc indexes under `/opt/docs/`:
-  - `/opt/docs/feishu-apifox-index.md` — Feishu (Lark) OpenAPI: \
-    plain-markdown list of ~400 endpoint / schema doc URLs. Grep it for \
-    the API you want (`rg '消息\\|message\\|bitable\\|approval' \
-    /opt/docs/feishu-apifox-index.md`), then `curl -fsSL <matched url>` \
-    to fetch the full endpoint doc. Use this whenever you build a \
-    Feishu / Lark integration (messaging, docs, bitable, sheets, \
-    calendar, approvals, workspace events, …) — it is faster and more \
-    reliable than web-searching for the API.
+- Bundled doc indexes under `/opt/docs/` (all llms.txt-format — a \
+markdown bullet list of doc URLs; grep for the endpoint, then \
+`curl -fsSL <matched url>` to fetch the full page). Prefer these over \
+web-searching — they are faster, quieter, and already curated:
+  - `/opt/docs/feishu-apifox-index.md` — Feishu / Lark: messaging, \
+    docs, bitable, sheets, calendar, approvals, workspace events, …
+  - `/opt/docs/dingtalk-apifox-index.md` — DingTalk: enterprise IM, \
+    mini-program, workbench, contacts, OA suite.
+  - `/opt/docs/douyin-apifox-index.md` — Douyin / TikTok (CN): auth, \
+    video, commerce, live.
+  - `/opt/docs/bilibili-apifox-index.md` — Bilibili creator + webhook \
+    endpoints.
+  - `/opt/docs/xiaohongshu-apifox-index.md` — Xiaohongshu (小红书): \
+    brand / marketing integrations.
+  - `/opt/docs/kuaishou-apifox-index.md` — Kuaishou short-video \
+    ecosystem.
+  Example: `rg -i 'bitable\\|多维表格' /opt/docs/feishu-apifox-index.md \
+  | head` → pick the URL → `curl -fsSL <url>` → write the integration.
 - `build-essential` (gcc, g++, make) is present so uv can compile \
 C-extension wheels on the fly.
 - Prefer `rg` over `grep -r` and `fd` over `find`: they are an order of \

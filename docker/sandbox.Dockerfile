@@ -86,17 +86,36 @@ RUN set -eux \
  && rm /tmp/duckdb.zip
 
 # --- Bundled documentation indexes ----------------------------------------
-# Plain-markdown API-doc indexes that the agent can grep offline to
-# discover which endpoints exist; linked sub-pages are still fetched live
-# (outbound network is open). Living under /opt/docs keeps them out of
-# $HOME so the bind-mount does not shadow them at runtime.
+# Plain-markdown API-doc indexes (llms.txt format) that the agent can
+# grep offline to discover which endpoints exist; linked sub-pages are
+# still fetched live (outbound network is open). Living under /opt/docs
+# keeps them out of $HOME so the bind-mount does not shadow them at
+# runtime.
 #
-# - Feishu (Lark) OpenAPI — published as llms.txt by Apifox; ~400 endpoint
-#   + schema doc URLs. Use when building any Feishu integration
-#   (messaging, docs, bitable, sheets, calendar, approvals, events, …).
+# All are hosted by Apifox and share the same shape: markdown bullets
+# `- <category> [<title>](<url>.md): <summary>`.
+#
+#   - Feishu (Lark) OpenAPI — messaging, docs, bitable, sheets, calendar,
+#     approvals, workspace events, …
+#   - DingTalk OpenAPI — enterprise IM, mini-program, workbench,
+#     contacts, OA suite.
+#   - Douyin / TikTok (CN) OpenAPI — auth, video, commerce, live.
+#   - Bilibili OpenAPI — creator + webhook endpoints.
+#   - Xiaohongshu (小红书) OpenAPI — brand/marketing critical platform.
+#   - Kuaishou OpenAPI — short-video ecosystem.
 RUN mkdir -p /opt/docs \
  && curl -fsSL --retry 3 https://feishu.apifox.cn/llms.txt \
-      -o /opt/docs/feishu-apifox-index.md
+      -o /opt/docs/feishu-apifox-index.md \
+ && curl -fsSL --retry 3 https://dingtalk.apifox.cn/llms.txt \
+      -o /opt/docs/dingtalk-apifox-index.md \
+ && curl -fsSL --retry 3 https://douyin.apifox.cn/llms.txt \
+      -o /opt/docs/douyin-apifox-index.md \
+ && curl -fsSL --retry 3 https://bilibili.apifox.cn/llms.txt \
+      -o /opt/docs/bilibili-apifox-index.md \
+ && curl -fsSL --retry 3 https://xiaohongshu.apifox.cn/llms.txt \
+      -o /opt/docs/xiaohongshu-apifox-index.md \
+ && curl -fsSL --retry 3 https://kuaishou.apifox.cn/llms.txt \
+      -o /opt/docs/kuaishou-apifox-index.md
 
 # --- Node 24 LTS via NodeSource --------------------------------------------
 RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
