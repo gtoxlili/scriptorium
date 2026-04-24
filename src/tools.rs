@@ -112,21 +112,63 @@ default (override via `timeout_seconds`).
 
 Pre-installed tools
 ───────────────────
-- Python 3.12 — pandas, numpy, pillow, requests, httpx, beautifulsoup4, \
+- Python 3.11 — pandas, numpy, pillow, requests, httpx, beautifulsoup4, \
 lxml, openpyxl, xlrd, weasyprint, playwright, selenium.
-- Node 20 — puppeteer-core, sharp.
-- Headless Chromium with Playwright drivers (use Python `playwright` or \
-Node `puppeteer-core`).
+- Node 20 — puppeteer-core, sharp. Globally installed under \
+`/usr/lib/node_modules` and exposed via `NODE_PATH`, so ad-hoc \
+`node script.js` with `require('sharp')` / `require('puppeteer-core')` \
+works without a local `npm install`.
+- Browsers: ONLY headless Chromium is preinstalled (via Playwright, \
+cached at `/opt/ms-playwright`). Do NOT attempt `playwright install \
+firefox`/`webkit` or `puppeteer`-style browser downloads — the cache \
+path is root-owned and the installer will fail.
 - Media — ffmpeg, imagemagick (`convert`), exiftool.
-- CLI — bash, curl, wget, jq, git, unzip, zip, openssh-client, ripgrep, \
-fd, openssl, gnupg.
+- CLI — bash, curl, wget, jq, git, unzip, zip, openssh-client, ripgrep \
+(`rg`), fd, openssl, gnupg. A C toolchain (`build-essential`: gcc, g++, \
+make) is also present, so `pip install --user <pkg>` works for packages \
+that need to compile C extensions.
+- Prefer `rg` over `grep -r` and `fd` over `find`: they are an order of \
+magnitude faster and respect sensible ignore rules by default.
+
+Composing commands
+──────────────────
+- INDEPENDENT shell tasks (no ordering / data dependency) should be \
+issued as SEPARATE parallel tool calls in a single turn, not fused \
+into one chained command.
+- DEPENDENT commands must be chained with `&&` inside ONE call so a \
+failure short-circuits — e.g. `mkdir -p $HOME/out && python3 \
+render.py > $HOME/out/report.md`.
+- Use `;` only when you explicitly want the next command to run even \
+if the previous one failed.
+- Do NOT use bare newlines to separate commands in the `command` \
+argument; chain with `&&` / `;`, or pass a heredoc to `bash -c`.
+- Quote paths containing spaces, CJK characters, or other special \
+characters with double quotes, e.g. `cat \"$HOME/inputs/年度报告.pdf\"`.
+- Each call starts a fresh shell at $HOME. `cd` only affects THAT \
+call's cwd; it never persists to the next call — use absolute paths \
+across calls.
 
 State persistence
 ─────────────────
 $HOME contents survive between `execute_shell` calls within the SAME \
 chat session — installed pip/npm packages, Playwright cookies, \
-intermediate files, ad-hoc scripts all stick. When the session ends the \
-workspace is eventually garbage-collected.
+intermediate files, ad-hoc scripts all stick. BEFORE installing or \
+downloading, check what is already there so you do not repeat work: \
+`ls $HOME/inputs $HOME/outputs 2>/dev/null`, `which <cli>`, or `python3 \
+-c 'import <pkg>'` before `pip install --user`. When the session ends \
+the workspace is eventually garbage-collected.
+
+Polling, waiting, and long output
+─────────────────────────────────
+- Do NOT `sleep` between commands that can run immediately — just run \
+them.
+- When polling an external process, use a check command (e.g. `gh run \
+view`, `curl -fsS <url>/status`, a short `until ... ; do sleep 2; done` \
+with a bounded counter) rather than a long blind `sleep`.
+- If a command is likely to produce a lot of output, redirect it to a \
+file under `$HOME/outputs/...` first and then print only a small slice \
+(`head`, `tail`, `jq`) so the tool response stays compact — this also \
+avoids triggering large-output spill (see below).
 
 What you CANNOT do
 ──────────────────
@@ -139,19 +181,26 @@ For missing Python deps: `pip install --user <pkg>` (lands in \
 $HOME/.local, persists with the session). For Node: \
 `npm install --prefix $HOME/.local <pkg>`.
 
-Bring inputs in by downloading them inside the command itself (for \
-example with `curl`, `wget`, Python `requests`, or Node) or by working \
-on files already present in $HOME, and hand outputs to the user via the \
-`deliver` tool ($HOME → object storage → URL).
+Bringing inputs in / handing outputs out
+────────────────────────────────────────
+- Inputs: download them inside the command itself (`curl`, `wget`, \
+Python `requests`, Node `fetch`) or work on files already present in \
+$HOME.
+- Outputs the user should see: hand them to the `deliver` tool \
+($HOME → object storage → PERMANENT URL). NEVER paste raw in-sandbox \
+paths (like `$HOME/outputs/foo.pdf`) to the user — they cannot reach \
+that path; only the delivered URL is user-visible.
 
 Large output handling
 ─────────────────────
-Some hosts may spill oversized stdout/stderr into a brand-workspace \
-file under `sandbox/...` instead of inlining the entire streams. In that \
-case the result can contain `output_mode=\"workspace_spill\"`, \
+Some hosts may spill oversized stdout/stderr into a host-side workspace \
+file under `sandbox/...` instead of inlining the entire streams. In \
+that case the result contains `output_mode=\"workspace_spill\"`, \
 `workspace_path`, `char_count`, `line_count`, `preview`, and `message` \
-instead of full stdout/stderr. Use the host's normal workspace read/search \
-tools on `workspace_path` to inspect the full spill.";
+instead of full stdout/stderr. Use the host's normal workspace \
+read/search tools on `workspace_path` to inspect the full spill. To \
+avoid hitting spill at all, write large output to a file under \
+`$HOME/outputs/...` yourself and only print a small summary.";
 
 const DELIVER_DESCRIPTION: &str = "\
 Package a file or directory produced in the sandbox, upload it to \
@@ -194,6 +243,14 @@ to later `execute_shell` calls for free.
 - Agent-internal state or scratch data.
 - Anything containing secrets you wouldn't show the user.
 
+Batching multiple related outputs
+─────────────────────────────────
+When the user should receive several related files as ONE deliverable \
+(e.g. a report plus its assets), write them into a single directory \
+like `$HOME/outputs/report-bundle/` and deliver the directory — the \
+user gets one URL instead of a wall of links, and file layout is \
+preserved inside the tar.gz.
+
 Typical flow: `execute_shell` produces $HOME/outputs/summary.pdf → \
 deliver(path=\"outputs/summary.pdf\", label=\"Q3 revenue summary\") → \
 receives {url: \"https://...\", size_bytes: 245_760, ...} → reply to \
@@ -214,39 +271,31 @@ Rules
 `target_path` becomes the copied directory root.
 - Existing targets are replaced.
 
-Typical flow: write or edit `sandbox/prompt.txt` with workspace tools → \
-copy_workspace_sandbox_to_execution_sandbox(source_path=\"sandbox/prompt.txt\", \
-target_path=\"inputs/prompt.txt\") → execute_shell(...) reads \
-$HOME/inputs/prompt.txt.
-
-Execution note: the actual transfer is performed by the host bridge layered \
-above scriptorium. Direct calls against bare scriptorium without that \
-bridge will fail.";
+Typical flow: write or edit `sandbox/prompt.txt` with the host's \
+workspace tools → copy_workspace_sandbox_to_execution_sandbox(\
+source_path=\"sandbox/prompt.txt\", target_path=\"inputs/prompt.txt\") → \
+execute_shell reads $HOME/inputs/prompt.txt.";
 
 const COPY_EXECUTION_SANDBOX_TO_WORKSPACE_SANDBOX_DESCRIPTION: &str = "\
 Copy a file or directory from the execution sandbox back into the brand \
 workspace `sandbox/` exchange folder. Use this when shell work produced \
-an output that should be inspected, searched, or edited with the normal \
-workspace tools.
+an output that should be inspected, searched, or edited with the \
+host's normal workspace tools.
 
 Rules
 ─────
 - `target_path` MUST point to `sandbox/...` inside the brand workspace.
 - `source_kind` must be `file` or `directory` because the execution \
 sandbox does not expose a separate stat tool.
-- Files are written directly to `target_path`.
-- Directories are uploaded as tar.gz, transferred back, then extracted so \
-`target_path` becomes the copied directory root.
-- Existing targets are replaced.
+- Files are copied straight to `target_path`; directories are \
+extracted so `target_path` becomes the copied directory root.
+- Existing targets at `target_path` are replaced.
 
-Typical flow: execute_shell(...) writes $HOME/outputs/report.md → \
-copy_execution_sandbox_to_workspace_sandbox(source_path=\"outputs/report.md\", \
-source_kind=\"file\", target_path=\"sandbox/report.md\") → inspect or \
-rewrite `sandbox/report.md` with workspace tools.
-
-Execution note: the actual transfer is performed by the host bridge layered \
-above scriptorium. Direct calls against bare scriptorium without that \
-bridge will fail.";
+Typical flow: execute_shell writes $HOME/outputs/report.md → \
+copy_execution_sandbox_to_workspace_sandbox(\
+source_path=\"outputs/report.md\", source_kind=\"file\", \
+target_path=\"sandbox/report.md\") → inspect or rewrite \
+`sandbox/report.md` with the host's workspace tools.";
 
 // ─── JSON Schema constants ────────────────────────────────────────────────
 // Per-parameter descriptions stay concise; the big-picture capability +

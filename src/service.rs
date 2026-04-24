@@ -719,7 +719,7 @@ impl Sandbox for SandboxService {
                     result_json: String::new(),
                     is_error: true,
                     error_message: format!(
-                        "tool {} requires an agent-core host bridge; direct scriptorium calls are unsupported",
+                        "tool {} is implemented by the host adapter, not inside scriptorium; route it through the host's sandbox tool layer",
                         inner.tool_name
                     ),
                 }));

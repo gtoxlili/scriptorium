@@ -19,8 +19,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
+    # Debian 12's system Python is PEP 668 "externally-managed"; without
+    # this flag `pip install --user <pkg>` fails — which is exactly the
+    # recipe the AI-facing execute_shell prompt advertises.
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     NODE_ENV=production \
     NPM_CONFIG_UPDATE_NOTIFIER=false \
+    # Globally-installed Node modules live here. Exposing via NODE_PATH
+    # lets ad-hoc `node script.js` find `puppeteer-core` / `sharp`
+    # without the agent having to `npm install` them locally again.
+    NODE_PATH=/usr/lib/node_modules \
     # Pin Playwright browser cache to a system path so it survives the
     # bind-mount over /home/agent at runtime.
     PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
@@ -38,6 +46,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
  && sed -i 's/# *\(zh_CN.UTF-8\)/\1/' /etc/locale.gen \
  && locale-gen \
+ # Debian's `fd-find` binary is `fdfind`; expose it as `fd` so the
+ # AI-facing prompt's "prefer fd over find" advice actually works.
+ && ln -s /usr/bin/fdfind /usr/local/bin/fd \
  && rm -rf /var/lib/apt/lists/*
 
 # --- Node 20 via NodeSource -------------------------------------------------
