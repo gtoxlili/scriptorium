@@ -5,8 +5,8 @@
 //! the resulting behaviour. They are gated behind `#[ignore]` because they
 //! require:
 //!   1. A reachable Docker daemon.
-//!   2. The `scriptorium-sandbox:debian12-v1` image (built via
-//!      `docker build -f docker/sandbox.Dockerfile -t scriptorium-sandbox:debian12-v1 .`).
+//!   2. The `scriptorium-sandbox:debian13-v1` image (built via
+//!      `docker build -f docker/sandbox.Dockerfile -t scriptorium-sandbox:debian13-v1 .`).
 //!
 //! Tests that also need TOS credentials use the `SCRIPTORIUM_TEST_TOS=1`
 //! env guard on top of that — see individual test docs.
@@ -47,7 +47,7 @@ fn discover_docker_socket() -> PathBuf {
 fn sandbox_cfg_for_tests() -> SandboxConfig {
     SandboxConfig {
         default_image: std::env::var("SCRIPTORIUM_TEST_IMAGE")
-            .unwrap_or_else(|_| "scriptorium-sandbox:debian12-v1".to_string()),
+            .unwrap_or_else(|_| "scriptorium-sandbox:debian13-v1".to_string()),
         default_timeout_seconds: 30,
         default_cpu_millis: 2000,
         default_memory_bytes: 2 * 1024 * 1024 * 1024,

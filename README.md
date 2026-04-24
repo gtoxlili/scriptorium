@@ -84,8 +84,9 @@ Full design rationale: [`docs/architecture.md`](docs/architecture.md).
   exchange tools). `CallTool` routes `execute_shell` / `deliver` through
   the same implementation path as the primitives; the exchange tools are
   intended for a host bridge layered above scriptorium.
-- **Fat sandbox image** with Python, Node 20, Chromium/Playwright, FFmpeg,
-  ImageMagick, and common CLIs pre-installed — no runtime `apt install` required.
+- **Fat sandbox image** (Debian 13) with Python 3.13 + `uv`, Node 24 LTS,
+  Chromium/Playwright, FFmpeg, ImageMagick, and common CLIs pre-installed —
+  no runtime `apt install` required.
 - **Workspace id validation** (`[A-Za-z0-9_-]{1,128}`) with host-side path
   traversal guards.
 - **tini init** inside the sandbox so Chromium child processes are reaped.
@@ -214,7 +215,7 @@ for external volumes — the Docker path sidesteps that.
 ## Build the sandbox image
 
 ```bash
-docker build -f docker/sandbox.Dockerfile -t scriptorium-sandbox:debian12-v1 .
+docker build -f docker/sandbox.Dockerfile -t scriptorium-sandbox:debian13-v1 .
 ```
 
 Image size is ~3 GB. The one-time download is the cost you pay for

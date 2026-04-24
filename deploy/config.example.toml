@@ -19,7 +19,7 @@ control_timeout_seconds = 60
 
 [sandbox]
 # Image tag is pinned by convention. Build it from docker/sandbox.Dockerfile.
-default_image = "scriptorium-sandbox:debian12-v1"
+default_image = "scriptorium-sandbox:debian13-v1"
 default_timeout_seconds = 300
 default_cpu_millis = 4000                        # 4 cores
 default_memory_bytes = 8589934592                # 8 GiB

@@ -101,7 +101,7 @@ conversion, or any shell work.
 
 Environment
 ───────────
-- Debian 12, UTF-8 + zh_CN.UTF-8 locales, Asia/Shanghai tz, Noto CJK + \
+- Debian 13, UTF-8 + zh_CN.UTF-8 locales, Asia/Shanghai tz, Noto CJK + \
 color-emoji fonts.
 - Non-root user `agent` (UID 1000). cwd is $HOME = /home/agent.
 - Root filesystem is READ-ONLY; only $HOME (persistent across calls in \
@@ -112,9 +112,15 @@ default (override via `timeout_seconds`).
 
 Pre-installed tools
 ───────────────────
-- Python 3.11 — pandas, numpy, pillow, requests, httpx, beautifulsoup4, \
-lxml, openpyxl, xlrd, weasyprint, playwright, selenium.
-- Node 20 — puppeteer-core, sharp. Globally installed under \
+- Python 3.13 — pandas, numpy, matplotlib, pillow, requests, httpx, \
+beautifulsoup4, lxml, openpyxl, weasyprint, playwright, jinja2, pyyaml, \
+tiktoken.
+- `uv` / `uvx` (Astral) — the ONLY Python package manager on this image. \
+`pip` is intentionally NOT installed; every Python install path below \
+goes through `uv`. uv's cache at $HOME/.cache/uv persists for the whole \
+session, so re-running the same `uv run --with <pkg>` is near-instant \
+after the first install.
+- Node 24 LTS — puppeteer-core, sharp. Globally installed under \
 `/usr/lib/node_modules` and exposed via `NODE_PATH`, so ad-hoc \
 `node script.js` with `require('sharp')` / `require('puppeteer-core')` \
 works without a local `npm install`.
@@ -123,12 +129,47 @@ cached at `/opt/ms-playwright`). Do NOT attempt `playwright install \
 firefox`/`webkit` or `puppeteer`-style browser downloads — the cache \
 path is root-owned and the installer will fail.
 - Media — ffmpeg, imagemagick (`convert`), exiftool.
-- CLI — bash, curl, wget, jq, git, unzip, zip, openssh-client, ripgrep \
-(`rg`), fd, openssl, gnupg. A C toolchain (`build-essential`: gcc, g++, \
-make) is also present, so `pip install --user <pkg>` works for packages \
-that need to compile C extensions.
+- CLI — bash, curl, wget, jq, git, unzip, zip, openssh-client, tree, \
+ripgrep (`rg`), fd, openssl, gnupg.
+- Data / media utilities — `yt-dlp` (resilient video/audio downloader \
+covering YouTube, Bilibili, Douyin/TikTok, Xiaohongshu, and most \
+streaming sites; prefer over hand-rolled scraping), `duckdb` (SQL CLI \
+for ad-hoc querying of CSV / Parquet / JSON — `duckdb -c \"SELECT ... \
+FROM read_csv_auto('file.csv')\"`).
+- `build-essential` (gcc, g++, make) is present so uv can compile \
+C-extension wheels on the fly.
 - Prefer `rg` over `grep -r` and `fd` over `find`: they are an order of \
 magnitude faster and respect sensible ignore rules by default.
+
+Installing extra Python packages (uv-only)
+──────────────────────────────────────────
+There is no `pip` on PATH. `python3 -m pip` will also fail. Use uv for \
+everything Python-package-shaped:
+
+- Ephemeral, one-shot scripts (the default — use this unless you have a \
+reason not to): `uv run --with <pkg> --with <pkg2> python script.py`, \
+or for inline code `uv run --with <pkg> python - <<'PY' ... PY`. uv \
+creates / reuses a cached env under $HOME/.cache/uv; the second \
+invocation with the same package set is effectively free.
+- Persistent across calls this session: create a venv once with `uv \
+venv $HOME/.venv --system-site-packages` (the flag lets the venv see \
+the baseline packages like pandas / playwright), then `uv pip install \
+--python $HOME/.venv/bin/python <pkg>`. Run scripts with \
+`$HOME/.venv/bin/python script.py`, or `source \
+$HOME/.venv/bin/activate` inside a single `execute_shell` command.
+- Project-scoped with a lockfile: `cd $HOME/<proj> && uv init && uv \
+add <pkg>` — pyproject.toml + uv.lock + .venv/ all live in $HOME and \
+survive for the rest of the session.
+
+If you see a README that tells you to `pip install foo`, mentally \
+translate it to `uv pip install --python $HOME/.venv/bin/python foo` \
+(after creating that venv) or `uv run --with foo python ...`.
+
+Installing extra Node packages
+──────────────────────────────
+`npm install --prefix $HOME/.local <pkg>` for persistent installs. \
+Globally-installed packages (puppeteer-core, sharp) already resolve via \
+NODE_PATH — no re-install needed.
 
 Composing commands
 ──────────────────
@@ -151,12 +192,14 @@ across calls.
 State persistence
 ─────────────────
 $HOME contents survive between `execute_shell` calls within the SAME \
-chat session — installed pip/npm packages, Playwright cookies, \
-intermediate files, ad-hoc scripts all stick. BEFORE installing or \
+chat session — uv's ephemeral-env cache ($HOME/.cache/uv), any venv you \
+create under $HOME (e.g. $HOME/.venv or $HOME/<proj>/.venv), \
+user-installed npm packages under $HOME/.local, Playwright cookies, \
+intermediate files, and ad-hoc scripts all stick. BEFORE installing or \
 downloading, check what is already there so you do not repeat work: \
 `ls $HOME/inputs $HOME/outputs 2>/dev/null`, `which <cli>`, or `python3 \
--c 'import <pkg>'` before `pip install --user`. When the session ends \
-the workspace is eventually garbage-collected.
+-c 'import <pkg>'` first. When the session ends the workspace is \
+eventually garbage-collected.
 
 Polling, waiting, and long output
 ─────────────────────────────────
@@ -176,10 +219,6 @@ What you CANNOT do
 not root).
 - Write outside $HOME or /tmp.
 - Escalate to root, open raw sockets, mount filesystems.
-
-For missing Python deps: `pip install --user <pkg>` (lands in \
-$HOME/.local, persists with the session). For Node: \
-`npm install --prefix $HOME/.local <pkg>`.
 
 Bringing inputs in / handing outputs out
 ────────────────────────────────────────
@@ -421,8 +460,12 @@ mod tests {
             "exec must flag read-only rootfs"
         );
         assert!(
-            shell.contains("pip install --user"),
-            "exec must point at --user for extra deps"
+            shell.contains("uv run --with"),
+            "exec must point at uv for extra Python deps (pip is not installed)"
+        );
+        assert!(
+            !shell.contains("pip install --user"),
+            "exec must not advertise `pip install --user` — pip is not installed in the image"
         );
         assert!(
             shell.contains("UID 1000") || shell.contains("Non-root"),
