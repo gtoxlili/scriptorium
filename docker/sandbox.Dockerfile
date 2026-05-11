@@ -71,7 +71,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       curl wget jq git unzip zip openssh-client \
       ripgrep fd-find tree \
       ffmpeg imagemagick exiftool \
-      fonts-noto-cjk fonts-noto-color-emoji \
+      fonts-noto-cjk fonts-noto-color-emoji fonts-symbola \
       python3 python3-venv \
       gnupg build-essential xz-utils \
  && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
@@ -81,6 +81,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  # AI-facing prompt's "prefer fd over find" advice actually works.
  && ln -s /usr/bin/fdfind /usr/local/bin/fd \
  && rm -rf /var/lib/apt/lists/*
+
+# --- Emoji fontconfig fallback -------------------------------------------
+# Debian's fonts-noto-color-emoji ships the font but no fontconfig snippet
+# that inserts it into the sans/serif/mono fallback chains. Without this,
+# Pango/Cairo-based renderers (WeasyPrint, ImageMagick, …) never reach
+# any emoji font and emit tofu. Symbola is included as a TrueType-outline
+# fallback for renderers that can't embed CBDT bitmap fonts (WeasyPrint
+# in PDF mode, matplotlib, Pillow). Chromium has its own emoji detection
+# and is unaffected. See the conf file for the full rationale.
+COPY docker/sandbox/46-emoji-fallback.conf /etc/fonts/conf.d/46-emoji-fallback.conf
+RUN fc-cache -f
 
 # --- uv (Astral) -----------------------------------------------------------
 # Copied straight from the official Astral image; tracks latest stable

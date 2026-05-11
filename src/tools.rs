@@ -108,7 +108,9 @@ conversion, or any shell work.
 Environment
 ───────────
 - Debian 13, UTF-8 + zh_CN.UTF-8 locales, Asia/Shanghai tz, Noto CJK + \
-color-emoji fonts.
+Noto Color Emoji + Symbola fonts (the latter is a TrueType-outline emoji \
+fallback for renderers that can't embed CBDT bitmap glyphs, e.g. \
+WeasyPrint to PDF, matplotlib, Pillow).
 - Non-root user `agent` (UID 1000). cwd is $HOME = /home/agent.
 - Root filesystem is READ-ONLY; only $HOME (persistent across calls in \
 this session) and /tmp (tmpfs, 2 GiB, per-call ephemeral) are writable.
