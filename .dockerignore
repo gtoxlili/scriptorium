@@ -4,6 +4,7 @@ target/
 tests/
 docker/
 !docker/service.Dockerfile
+!docker/sandbox/
 docker-compose*.yml
 .env
 .env.*
